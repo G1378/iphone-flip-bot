@@ -1,0 +1,79 @@
+volumes:
+  # A plain Docker-managed named volume by default — this works out of the
+  # box on a microSD-only Pi (no SSD required for the MVP; a small phone-
+  # flipping business's database will realistically stay tens of MB to a
+  # few GB for a long time). Docker creates and owns the storage itself,
+  # so there's nothing to pre-create and no bind-mount path to get wrong.
+  #
+  # If you DO have an SSD and want Postgres's data on it for extra
+  # reliability, the cleanest approach on a Pi is to move Docker's whole
+  # storage location rather than bind-mounting this one volume: stop
+  # Docker, edit /etc/docker/daemon.json to add {"data-root": "/mnt/ssd/docker"},
+  # copy /var/lib/docker to that path, then restart Docker. Every volume
+  # (not just this one) then lives on the SSD automatically. See README
+  # section 10 for the full walkthrough and the bind-mount alternative.
+  postgres_data:
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-iphoneflip}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-iphoneflip}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Deliberately NOT exposed to the host/internet (spec section 31) -
+    # only the bot container can reach it, over the internal compose network.
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-iphoneflip} -d ${POSTGRES_DB:-iphoneflip}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-iphoneflip}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-iphoneflip}
+      DATABASE_URL_SYNC: postgresql+psycopg2://${POSTGRES_USER:-iphoneflip}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-iphoneflip}
+    volumes:
+      # Mount the Google service-account key read-only, if configured.
+      - ${GOOGLE_SERVICE_ACCOUNT_HOST_PATH:-./secrets/google_service_account.json}:/run/secrets/google_service_account.json:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # One-shot helper: `docker compose run --rm backup` (see scripts/backup.sh)
+  backup:
+    build: .
+    profiles: ["tools"]
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER:-iphoneflip}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:-iphoneflip}
+    volumes:
+      - ${BACKUP_DIR:-./backups}:/backups
+      - ./scripts:/app/scripts:ro
+    entrypoint: ["/bin/bash", "/app/scripts/backup.sh"]
