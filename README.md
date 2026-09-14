@@ -66,7 +66,7 @@ tests/             pytest suite against a real Postgres test database
 
 - A Raspberry Pi 5 (8GB recommended) running Raspberry Pi OS (64-bit).
   A microSD card alone is fine to get started (this MVP's database is
-  small for a small business); see section 10 if you later want to move
+  small for a small business); see section 11 if you later want to move
   storage onto an SSD/USB drive for extra reliability.
 - Docker + Docker Compose.
 - A Discord account and server (guild) you administer.
@@ -97,13 +97,13 @@ docker compose version
 # 5. Clone/copy this project onto the Pi
 git clone <your-repo-url> iphone-flip-bot   # or scp the folder over
 cd iphone-flip-bot
-mkdir -p backups   # used by the backup script, section 10
+mkdir -p backups   # used by the backup script, section 11
 ```
 
 No SSD is required to get started — Postgres's data lives in a normal
 Docker-managed volume by default, which is fine on the microSD card for a
 small business's inventory (realistically tens of MB, maybe low GB after
-years of data). If you pick up an SSD or USB drive later, see section 10
+years of data). If you pick up an SSD or USB drive later, see section 11
 for how to move onto it without losing data.
 
 ---
@@ -116,7 +116,10 @@ for how to move onto it without losing data.
    this bot is slash-command only and never reads message content.
 4. **OAuth2 -> URL Generator**: scopes = `bot`, `applications.commands`.
    Permissions: `Send Messages`, `Embed Links`, `Use Slash Commands`,
-   `Read Message History`, `Attach Files`. Open the generated URL and
+   `Read Message History`, `Attach Files`, `Manage Channels` (only needed
+   for `/setup-channels` — see section 9 — safe to skip if you'd rather
+   create channels yourself), `Manage Messages` (used to pin the cheat-sheet
+   in each channel `/setup-channels` creates). Open the generated URL and
    invite the bot to your server.
 5. Enable Developer Mode in Discord (User Settings -> Advanced), right
    click your server -> **Copy Server ID** -> this is `DISCORD_GUILD_ID`
@@ -220,15 +223,51 @@ Then in Discord:
 ```
 /config users add user:@you admin:true
 ```
-You're now fully operational. Try `/demo` (see section 12) to load a
+You're now fully operational. Try `/demo` (see section 13) to load a
 realistic example dataset, or start for real with `/buy`.
 
 ---
 
-## 9. Discord command reference
+## 9. Channel setup & control panel
+
+You don't have to organize channels by hand. As an admin, run:
+```
+/setup-channels
+```
+This creates (or registers, if they already exist) a standard set of
+channels — 🏠 home, 📱 inventory, 🔩 donors-parts, 🔧 repairs, 💷 finance,
+🏷️ ebay-listings, ⚙️ admin, 🔔 notifications — and pins a short command
+cheat-sheet in each one. (Requires the bot to have the **Manage Channels**
+permission; if it doesn't, the command tells you so and you can create the
+channels yourself and register each with `/config channels`.)
+
+Then, in the `#home` channel, run:
+```
+/home
+```
+This posts an interactive **control panel** — no typing required for the
+basics:
+- **Jump buttons** to every other channel above.
+- **⚙️ Business Settings** — a form for business name, postage/packaging
+  defaults, minimum profit/ROI (admin only).
+- **📍 Add Location** — a form to add a new storage location (admin only).
+- **👥 Authorize User** — pick someone from a member list to grant bot
+  access, no need to know their Discord ID (admin only).
+- **🔄 Refresh** — updates the live stats (stock value, phones awaiting
+  parts, this month's profit, eBay/Sheets status) shown at the top.
+- **eBay Status** / **Sheets Status** / **📊 Monthly Report** — read-only
+  info, available to anyone authorized.
+
+The panel has no timeout and keeps working after a bot restart — pin the
+message in `#home` so it's always the first thing you see.
+
+---
+
+## 10. Discord command reference
 
 | Group | Commands |
 |---|---|
+| Home | `/home` `/setup-channels` (admin) |
 | Inventory | `/buy` `/stock` `/phone` `/edit-phone` `/move` `/status` `/fault` |
 | Testing | `/testing` `/test` `/test-result` |
 | Donors | `/donor` `/donors` `/teardown` `/donor-parts` `/allocate-cost` |
@@ -248,7 +287,7 @@ repair) require an explicit **Confirm/Cancel** button press.
 
 ---
 
-## 10. Backups
+## 11. Backups
 
 ```bash
 # Manual backup
@@ -309,7 +348,7 @@ docker compose up -d
 
 ---
 
-## 11. Updating the application
+## 12. Updating the application
 
 ```bash
 git pull            # or copy over your updated files
@@ -337,7 +376,7 @@ The same check also runs as part of `pytest` (`tests/test_command_tree.py`).
 
 ---
 
-## 12. Demo data
+## 13. Demo data
 
 ```
 /demo
@@ -355,7 +394,7 @@ without waiting for real data.
 
 ---
 
-## 13. Tests
+## 14. Tests
 
 ```bash
 createdb iphoneflip_test
@@ -374,7 +413,7 @@ idempotent Google Sheets sync.
 
 ---
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
@@ -388,7 +427,7 @@ idempotent Google Sheets sync.
 
 ---
 
-## 15. Known limitations of this MVP
+## 16. Known limitations of this MVP
 
 In the spirit of not overbuilding and being upfront about scope, a few
 things are intentionally minimal in this first pass and would be natural

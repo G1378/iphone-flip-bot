@@ -203,6 +203,21 @@ async def notification_channel_ids(session: AsyncSession) -> list[int]:
     return list(rows)
 
 
+async def get_channel_id_by_purpose(session: AsyncSession, purpose: str) -> Optional[int]:
+    row = (
+        await session.execute(
+            select(BotChannel.channel_id).where(BotChannel.purpose == purpose, BotChannel.active.is_(True))
+        )
+    ).scalar_one_or_none()
+    return row
+
+
+async def all_registered_channels(session: AsyncSession) -> Sequence[BotChannel]:
+    return (
+        await session.execute(select(BotChannel).where(BotChannel.active.is_(True)))
+    ).scalars().all()
+
+
 # ----------------------------------------------------------------------
 # Workflow statuses
 # ----------------------------------------------------------------------

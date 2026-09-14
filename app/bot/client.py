@@ -15,6 +15,7 @@ from app.services import config_service
 logger = logging.getLogger(__name__)
 
 INITIAL_COGS = [
+    "app.bot.cogs.home",
     "app.bot.cogs.inventory",
     "app.bot.cogs.testing",
     "app.bot.cogs.donors",
