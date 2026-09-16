@@ -122,4 +122,6 @@ DEFAULT_BUSINESS_SETTINGS = [
     ("min_profit_gbp", "20.00", "number", "Global minimum acceptable net profit"),
     ("min_roi_pct", "15.00", "number", "Global minimum acceptable ROI %"),
     ("target_margin_pct", "25.00", "number", "Global target margin %"),
+    ("default_repair_cost_assumption", "60.00", "number",
+     "Fallback repair cost estimate used for faulty-phone buy price recommendations when a model has no repair history yet"),
 ]

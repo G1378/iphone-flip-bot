@@ -73,6 +73,16 @@ class SaleSource(str, enum.Enum):
     MANUAL = "MANUAL"
 
 
+class PriceConditionBucket(str, enum.Enum):
+    USED = "USED"       # working, resale-grade (eBay 'Used' condition)
+    FAULTY = "FAULTY"   # eBay 'For parts or not working'
+
+
+class PriceDataSource(str, enum.Enum):
+    SOLD = "SOLD"                               # eBay Marketplace Insights (actual sold comps)
+    ACTIVE_LISTING_ESTIMATE = "ACTIVE_LISTING_ESTIMATE"  # eBay Browse API (asking prices - fallback)
+
+
 class EntityType(str, enum.Enum):
     PHONE = "PHONE"
     DONOR = "DONOR"
@@ -82,6 +92,7 @@ class EntityType(str, enum.Enum):
     LISTING = "LISTING"
     SALE = "SALE"
     EXPENSE = "EXPENSE"
+    SYSTEM = "SYSTEM"
 
 
 class InventoryEventType(str, enum.Enum):
@@ -117,3 +128,6 @@ class InventoryEventType(str, enum.Enum):
     EXPENSE_ADDED = "EXPENSE_ADDED"
     MANUAL_ADJUSTMENT = "MANUAL_ADJUSTMENT"
     SHEETS_SYNCED = "SHEETS_SYNCED"
+    PRICE_WATCHLIST_ADDED = "PRICE_WATCHLIST_ADDED"
+    PRICE_WATCHLIST_REMOVED = "PRICE_WATCHLIST_REMOVED"
+    PRICE_OBSERVED = "PRICE_OBSERVED"

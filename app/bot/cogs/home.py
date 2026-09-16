@@ -197,8 +197,10 @@ class HomeView(discord.ui.View):
     async def ebay_status(self, interaction: discord.Interaction, button: discord.ui.Button):
         bot = interaction.client
         configured = bot.ebay_client.configured
+        buy_configured = bot.ebay_client.buy_apis_configured
         e = discord.Embed(title="eBay integration status", colour=discord.Colour.green() if configured else discord.Colour.red())
-        e.add_field(name="Configured", value="✅ Yes" if configured else "❌ No", inline=False)
+        e.add_field(name="Listings & orders", value="✅ Yes" if configured else "❌ No", inline=True)
+        e.add_field(name="Pricing (/pricing)", value="✅ Yes" if buy_configured else "❌ No", inline=True)
         job = bot.job_scheduler.state.ebay if bot.job_scheduler else None
         if job and job.last_run_at:
             e.add_field(name="Last sync", value=str(job.last_run_at), inline=True)

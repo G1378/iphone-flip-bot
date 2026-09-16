@@ -48,6 +48,19 @@ class EbayOrder:
     fulfillment_status: Optional[str] = None
 
 
+@dataclass
+class PriceStats:
+    """Aggregate pricing stats for a search query + condition, from either
+    actual sold comps or (as a fallback) current active listing prices."""
+    source: str          # "SOLD" | "ACTIVE_LISTING_ESTIMATE"
+    sample_count: int
+    avg_price: Decimal
+    median_price: Decimal
+    min_price: Decimal
+    max_price: Decimal
+    currency: str = "GBP"
+
+
 class EbayClientInterface(abc.ABC):
     """Everything the rest of the app needs from eBay. Two implementations:
     - integrations.ebay.client.EbayClient  (real REST calls)
@@ -71,3 +84,20 @@ class EbayClientInterface(abc.ABC):
 
     @abc.abstractmethod
     async def get_listing_status(self, listing_id: str) -> Optional[str]: ...
+
+    @abc.abstractmethod
+    async def get_sold_price_stats(self, query: str, condition_ids: list[str], days_back: int = 90) -> Optional[PriceStats]:
+        """Actual sold comps via eBay's Marketplace Insights API. This is a
+        'limited release' API that requires separate eBay approval beyond a
+        normal developer account - implementations should return None
+        (never raise) when it's unavailable/unauthorized, so callers can
+        fall back to get_active_listing_price_stats cleanly."""
+        ...
+
+    @abc.abstractmethod
+    async def get_active_listing_price_stats(self, query: str, condition_ids: list[str]) -> Optional[PriceStats]:
+        """Current asking prices via eBay's Browse API (always available
+        with a standard developer account). Used as a fallback estimate
+        when sold data isn't available - typically runs 10-20% above
+        actual sold prices, since these are asking prices, not sold ones."""
+        ...

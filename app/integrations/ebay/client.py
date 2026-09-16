@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import statistics
 from decimal import Decimal
 from typing import Optional
 
@@ -15,6 +16,7 @@ from app.integrations.ebay.interface import (
     EbayOrder,
     EbayOrderLineItem,
     ListingResult,
+    PriceStats,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,8 +55,11 @@ class EbayClient(EbayClientInterface):
 
     def __init__(self) -> None:
         self.configured = settings.ebay_configured
+        self.buy_apis_configured = settings.ebay_buy_apis_configured
         self._access_token: Optional[str] = None
         self._token_expires_at: Optional[dt.datetime] = None
+        self._app_access_token: Optional[str] = None
+        self._app_token_expires_at: Optional[dt.datetime] = None
         self._http = httpx.AsyncClient(base_url=_base_url(), timeout=20.0)
 
     async def aclose(self) -> None:
@@ -89,6 +94,41 @@ class EbayClient(EbayClientInterface):
         self._token_expires_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=expires_in - 60)
         return self._access_token
 
+    async def _get_app_access_token(self) -> str:
+        """Client-credentials grant for the Buy APIs (Browse, Marketplace
+        Insights). No user consent/refresh token needed - just the app's
+        own client_id/client_secret - so pricing lookups work even before
+        scripts/ebay_oauth_setup.py has been run for the Sell APIs."""
+        if self._app_access_token and self._app_token_expires_at and dt.datetime.now(dt.timezone.utc) < self._app_token_expires_at:
+            return self._app_access_token
+
+        auth = (settings.ebay_client_id, settings.ebay_client_secret)
+        data = {
+            "grant_type": "client_credentials",
+            "scope": "https://api.ebay.com/oauth/api_scope/buy.marketplace.insights "
+                     "https://api.ebay.com/oauth/api_scope",
+        }
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(_auth_url(), data=data, auth=auth,
+                                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+        if resp.status_code != 200:
+            logger.error("eBay app token request failed with status %s", resp.status_code)
+            raise EbayApiError(f"eBay app token request failed (status {resp.status_code})")
+
+        payload = resp.json()
+        self._app_access_token = payload["access_token"]
+        expires_in = int(payload.get("expires_in", 7200))
+        self._app_token_expires_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=expires_in - 60)
+        return self._app_access_token
+
+    async def _app_headers(self) -> dict[str, str]:
+        token = await self._get_app_access_token()
+        return {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "X-EBAY-C-MARKETPLACE-ID": settings.ebay_marketplace_id,
+        }
+
     async def _headers(self) -> dict[str, str]:
         token = await self._get_access_token()
         return {
@@ -116,12 +156,35 @@ class EbayClient(EbayClientInterface):
             raise _RetryableHttpError(resp)
         return resp
 
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=1, max=20),
+        retry=retry_if_exception_type(_RetryableHttpError),
+    )
+    async def _app_request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """Same as _request but authenticated with the app-level (client
+        credentials) token, for the Buy APIs used by pricing lookups."""
+        headers = kwargs.pop("headers", {})
+        headers.update(await self._app_headers())
+        resp = await self._http.request(method, path, headers=headers, **kwargs)
+        if resp.status_code in RETRYABLE_STATUS:
+            raise _RetryableHttpError(resp)
+        return resp
+
     def _ensure_configured(self) -> None:
         if not self.configured:
             from app.integrations.ebay.interface import EbayNotConfiguredError
             raise EbayNotConfiguredError(
                 "eBay integration is not configured. Set EBAY_CLIENT_ID, EBAY_CLIENT_SECRET "
                 "and EBAY_REFRESH_TOKEN, or run scripts/ebay_oauth_setup.py."
+            )
+
+    def _ensure_buy_apis_configured(self) -> None:
+        if not self.buy_apis_configured:
+            from app.integrations.ebay.interface import EbayNotConfiguredError
+            raise EbayNotConfiguredError(
+                "eBay pricing lookups need EBAY_CLIENT_ID and EBAY_CLIENT_SECRET to be set."
             )
 
     # ------------------------------------------------------------------
@@ -238,6 +301,85 @@ class EbayClient(EbayClientInterface):
                 )
             )
         return orders
+
+    # ------------------------------------------------------------------
+    # Pricing (Buy APIs: Marketplace Insights for sold comps, Browse as
+    # an always-available fallback for active-listing price estimates)
+    # ------------------------------------------------------------------
+    async def get_sold_price_stats(self, query: str, condition_ids: list[str], days_back: int = 90) -> Optional[PriceStats]:
+        self._ensure_buy_apis_configured()
+        params = {
+            "q": query,
+            "filter": f"conditionIds:{{{'|'.join(condition_ids)}}}",
+            "limit": "100",
+        }
+        try:
+            resp = await self._app_request("GET", "/buy/marketplace_insights/v1_beta/item_sales/search", params=params)
+        except EbayApiError:
+            return None
+
+        if resp.status_code == 403:
+            # Marketplace Insights is a limited-release API - a 403 here
+            # almost always means this developer account isn't approved
+            # for it yet. Treat as "unavailable", not an error - the
+            # pricing service falls back to active-listing estimates.
+            logger.info("Marketplace Insights returned 403 (likely not approved for this app) - falling back.")
+            return None
+        if resp.status_code != 200:
+            logger.warning("Marketplace Insights search failed: HTTP %s", resp.status_code)
+            return None
+
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days_back)
+        prices: list[Decimal] = []
+        for item in resp.json().get("itemSales", []):
+            try:
+                sold_at_raw = item.get("lastSoldDate") or item.get("soldDate")
+                if sold_at_raw:
+                    sold_at = dt.datetime.fromisoformat(sold_at_raw.replace("Z", "+00:00"))
+                    if sold_at < cutoff:
+                        continue
+                price_val = item.get("lastSoldPrice", {}).get("value") or item.get("price", {}).get("value")
+                if price_val:
+                    prices.append(Decimal(str(price_val)))
+            except (KeyError, ValueError, TypeError):
+                continue
+
+        return _stats_from_prices(prices, source="SOLD")
+
+    async def get_active_listing_price_stats(self, query: str, condition_ids: list[str]) -> Optional[PriceStats]:
+        self._ensure_buy_apis_configured()
+        params = {
+            "q": query,
+            "filter": f"conditionIds:{{{'|'.join(condition_ids)}}}",
+            "limit": "100",
+        }
+        resp = await self._app_request("GET", "/buy/browse/v1/item_summary/search", params=params)
+        if resp.status_code != 200:
+            raise EbayApiError(f"Browse API search failed: HTTP {resp.status_code}")
+
+        prices: list[Decimal] = []
+        for item in resp.json().get("itemSummaries", []):
+            try:
+                price_val = item.get("price", {}).get("value")
+                if price_val:
+                    prices.append(Decimal(str(price_val)))
+            except (KeyError, ValueError, TypeError):
+                continue
+
+        return _stats_from_prices(prices, source="ACTIVE_LISTING_ESTIMATE")
+
+
+def _stats_from_prices(prices: list[Decimal], source: str) -> Optional[PriceStats]:
+    if not prices:
+        return None
+    return PriceStats(
+        source=source,
+        sample_count=len(prices),
+        avg_price=(sum(prices) / len(prices)).quantize(Decimal("0.01")),
+        median_price=Decimal(str(statistics.median(prices))).quantize(Decimal("0.01")),
+        min_price=min(prices),
+        max_price=max(prices),
+    )
 
 
 def _map_condition(condition_text: str) -> str:

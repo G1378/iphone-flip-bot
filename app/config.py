@@ -55,10 +55,20 @@ class Settings(BaseSettings):
     # Background job intervals (minutes)
     ebay_sync_interval_minutes: int = 15
     sheets_sync_interval_minutes: int = 10
+    pricing_sync_interval_days: int = 7
 
     @property
     def ebay_configured(self) -> bool:
         return bool(self.ebay_client_id and self.ebay_client_secret and self.ebay_refresh_token)
+
+    @property
+    def ebay_buy_apis_configured(self) -> bool:
+        """eBay's Buy APIs (Browse, Marketplace Insights - used for pricing
+        lookups) authenticate with an application-level client-credentials
+        token, not the user-consented refresh token that the Sell APIs
+        (listings, orders) need. So pricing features can work even before
+        the one-time Sell OAuth setup script has been run."""
+        return bool(self.ebay_client_id and self.ebay_client_secret)
 
     @property
     def sheets_configured(self) -> bool:

@@ -18,6 +18,7 @@ from app.jobs.ebay_sync_job import sync_ebay_orders
 from app.services import config_service
 from app.services import listings as listings_service
 from app.services import phones as phones_service
+from app.services import pricing as pricing_service
 
 
 def _default_title(phone) -> str:
@@ -153,7 +154,7 @@ class EbayCog(commands.Cog):
                 await interaction.response.send_message(embed=error_embed(f"No phone found with ID `{internal_id}`."), ephemeral=True)
                 return
             phone_model = await config_service.get_or_create_phone_model(session, phone.manufacturer, phone.model, phone.variant)
-            default_price = phone_model.default_sale_price or Decimal("0")
+            default_price = await pricing_service.get_current_estimated_sale_price(session, phone) or Decimal("0")
 
         defaults = {
             "title": _default_title(phone), "price": default_price,

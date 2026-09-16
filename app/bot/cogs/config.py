@@ -233,7 +233,7 @@ class ConfigCog(commands.GroupCog, group_name="config"):
         await interaction.response.send_message(embed=e)
 
     # ------------------------------------------------------------------
-    @app_commands.command(name="pricing", description="Set per-model pricing rule overrides")
+    @app_commands.command(name="pricing-rules", description="Manually override sale price/thresholds for one model (wins over live /pricing data)")
     @require_admin()
     async def pricing(self, interaction: discord.Interaction, model: str, default_sale_price: Optional[float] = None,
                        min_profit_gbp: Optional[float] = None, min_roi_pct: Optional[float] = None):
@@ -258,14 +258,22 @@ class ConfigCog(commands.GroupCog, group_name="config"):
     @require_admin()
     async def ebay(self, interaction: discord.Interaction):
         configured = settings.ebay_configured
+        buy_configured = settings.ebay_buy_apis_configured
         e = discord.Embed(title="eBay configuration", colour=discord.Colour.green() if configured else discord.Colour.orange())
-        e.add_field(name="Status", value="✅ Configured" if configured else "❌ Not configured", inline=False)
+        e.add_field(name="Listings & orders (Sell APIs)", value="✅ Configured" if configured else "❌ Not configured", inline=False)
+        e.add_field(name="Pricing lookups (Buy APIs)", value="✅ Configured" if buy_configured else "❌ Not configured", inline=False)
         e.add_field(name="Environment", value=settings.ebay_env, inline=True)
         e.add_field(name="Marketplace", value=settings.ebay_marketplace_id, inline=True)
-        if not configured:
+        if not buy_configured:
             e.add_field(
-                name="To configure", value="Set `EBAY_CLIENT_ID`, `EBAY_CLIENT_SECRET` and `EBAY_REFRESH_TOKEN` "
-                                            "in the bot's `.env` file (see README) — credentials never go through Discord.",
+                name="To enable pricing (/pricing)", value="Set `EBAY_CLIENT_ID` and `EBAY_CLIENT_SECRET` "
+                                                             "in the bot's `.env` file — no user OAuth needed for this part.",
+                inline=False,
+            )
+        if buy_configured and not configured:
+            e.add_field(
+                name="To enable listings/orders (/list, /ebay-sync)",
+                value="Also set `EBAY_REFRESH_TOKEN` — run `python scripts/ebay_oauth_setup.py` once (see README).",
                 inline=False,
             )
         await interaction.response.send_message(embed=e, ephemeral=True)

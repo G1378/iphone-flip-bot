@@ -11,6 +11,7 @@ from app.integrations.ebay.interface import (
     EbayOrder,
     EbayOrderLineItem,
     ListingResult,
+    PriceStats,
 )
 
 
@@ -24,9 +25,12 @@ class MockEbayClient(EbayClientInterface):
 
     def __init__(self, configured: bool = True) -> None:
         self.configured = configured
+        self.buy_apis_configured = configured
         self._id_counter = itertools.count(1000)
         self.listings: dict[str, dict] = {}       # listing_id -> data
         self.pending_orders: list[EbayOrder] = []  # queued for get_orders_since
+        self._sold_stats: dict[str, PriceStats] = {}     # query -> canned stats
+        self._active_stats: dict[str, PriceStats] = {}
 
     def _ensure_configured(self) -> None:
         if not self.configured:
@@ -60,7 +64,21 @@ class MockEbayClient(EbayClientInterface):
         entry = self.listings.get(listing_id)
         return entry["status"] if entry else None
 
-    # test helper, not part of the interface
+    async def get_sold_price_stats(self, query: str, condition_ids: list, days_back: int = 90) -> Optional[PriceStats]:
+        self._ensure_configured()
+        return self._sold_stats.get(query)
+
+    async def get_active_listing_price_stats(self, query: str, condition_ids: list) -> Optional[PriceStats]:
+        self._ensure_configured()
+        return self._active_stats.get(query)
+
+    # test helpers, not part of the interface
+    def queue_sold_stats(self, query: str, stats: PriceStats) -> None:
+        self._sold_stats[query] = stats
+
+    def queue_active_listing_stats(self, query: str, stats: PriceStats) -> None:
+        self._active_stats[query] = stats
+
     def queue_sale(self, *, order_id: str, sku: str, price: Decimal, fees: Decimal,
                     created_at: Optional[dt.datetime] = None) -> None:
         self.pending_orders.append(

@@ -108,8 +108,11 @@ async def analyse_phone(
     rule = await config_service.get_pricing_rule(session, phone_model.id)
 
     if expected_sale_price is None:
-        expected_sale_price = (rule.default_sale_price if rule and rule.default_sale_price else None) \
-            or phone_model.default_sale_price or Decimal("0")
+        expected_sale_price = rule.default_sale_price if rule and rule.default_sale_price else None
+        if expected_sale_price is None:
+            from app.services import pricing as pricing_service
+            expected_sale_price = await pricing_service.get_current_estimated_sale_price(session, phone)
+        expected_sale_price = expected_sale_price or Decimal("0")
 
     fee_pct = await config_service.get_setting_decimal(session, "ebay_fee_pct_assumption", Decimal("12.8"))
     fee_fixed = await config_service.get_setting_decimal(session, "ebay_fixed_fee_assumption", Decimal("0.30"))

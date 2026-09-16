@@ -66,7 +66,7 @@ tests/             pytest suite against a real Postgres test database
 
 - A Raspberry Pi 5 (8GB recommended) running Raspberry Pi OS (64-bit).
   A microSD card alone is fine to get started (this MVP's database is
-  small for a small business); see section 11 if you later want to move
+  small for a small business); see section 12 if you later want to move
   storage onto an SSD/USB drive for extra reliability.
 - Docker + Docker Compose.
 - A Discord account and server (guild) you administer.
@@ -97,13 +97,13 @@ docker compose version
 # 5. Clone/copy this project onto the Pi
 git clone <your-repo-url> iphone-flip-bot   # or scp the folder over
 cd iphone-flip-bot
-mkdir -p backups   # used by the backup script, section 11
+mkdir -p backups   # used by the backup script, section 12
 ```
 
 No SSD is required to get started — Postgres's data lives in a normal
 Docker-managed volume by default, which is fine on the microSD card for a
 small business's inventory (realistically tens of MB, maybe low GB after
-years of data). If you pick up an SSD or USB drive later, see section 11
+years of data). If you pick up an SSD or USB drive later, see section 12
 for how to move onto it without losing data.
 
 ---
@@ -223,7 +223,7 @@ Then in Discord:
 ```
 /config users add user:@you admin:true
 ```
-You're now fully operational. Try `/demo` (see section 13) to load a
+You're now fully operational. Try `/demo` (see section 14) to load a
 realistic example dataset, or start for real with `/buy`.
 
 ---
@@ -263,11 +263,91 @@ message in `#home` so it's always the first thing you see.
 
 ---
 
-## 10. Discord command reference
+## 10. Automated pricing & buy-price recommendations
+
+The bot can track live eBay pricing for the models you care about and
+recommend what to pay for a **used (working)** vs **faulty (repair)**
+unit of each one.
+
+### How pricing data is sourced
+
+eBay only exposes actual *sold* prices through the **Marketplace
+Insights API**, which is a limited-release endpoint - it needs separate
+approval from eBay beyond a normal developer account, and most accounts
+won't have it by default. So this feature tries sold data first and
+automatically falls back to an estimate from **current active listing**
+prices (always available with a standard account) when sold data isn't
+available or has too few samples. Every price shown is labeled `sold` or
+`est.` so you always know which one you're looking at - active-listing
+estimates typically run 10-20% above actual sold prices, since they're
+asking prices, not completed sales.
+
+Both lookups only need `EBAY_CLIENT_ID` and `EBAY_CLIENT_SECRET` in
+`.env` - unlike listings/orders, pricing doesn't need the Sell API
+refresh token, so it works even before you've run
+`scripts/ebay_oauth_setup.py`.
+
+### Commands
+
+```
+/pricing watch model:"iPhone 13 Pro" storage:128GB     (admin - add to watchlist)
+/pricing unwatch model:"iPhone 13 Pro" storage:128GB    (admin - remove from watchlist)
+/pricing watchlist                                       (show what's tracked)
+/pricing table                                            (show the pricing table + a Refresh button)
+/pricing refresh                                          (refresh every watched model right now)
+```
+
+Leave `storage` off to track a model broadly instead of per-capacity
+(fewer, noisier comps but works for models where storage doesn't move
+the price much).
+
+A **weekly background job** refreshes every watched entry automatically
+(interval configurable via `PRICING_SYNC_INTERVAL_DAYS` in `.env`,
+default 7 days) - `/pricing table` also has a **🔄 Refresh now** button
+for an on-demand pull any time.
+
+### How the recommended buy prices are calculated
+
+- **Used (resale-ready):** `median sold/asking price − estimated eBay fees − postage − packaging − your minimum profit`
+- **Faulty (bought for repair):** the same used-buy price, minus an
+  **estimated repair cost** for that model — pulled from your own
+  completed-repair history once you have some (`/pricing table` shows
+  which one it's using), falling back to the `default_repair_cost_assumption`
+  business setting (default £60, change it with
+  `/config business key:default_repair_cost_assumption value:75.00`) until
+  you do.
+
+Fee/postage/packaging/profit assumptions are the same ones `/analyse`
+uses (`/config business` and `/config thresholds`), so the numbers stay
+consistent across the app.
+
+### Feeds into `/analyse` and `/list` automatically
+
+Once a model has live pricing data, `/analyse` and `/list` use it as the
+default expected sale price automatically (storage-specific if you're
+tracking that storage, otherwise the model's general default) - no need
+to manually keep prices up to date. An explicit price you type into
+`/analyse` or a per-model override set via `/config pricing-rules` always
+wins over the automatic figure.
+
+### A note on eBay condition IDs
+
+The feature filters eBay searches using condition ID `3000` ("Used") for
+the used bucket and `7000` ("For parts or not working") for the faulty
+bucket - these are stable, well-documented IDs used broadly across
+eBay's category tree. If your eBay category defines more granular
+sub-grades and the numbers coming back look off once you have real data,
+that's the first thing to check (see `app/services/pricing.py`, near the
+top, for where these are defined).
+
+---
+
+## 11. Discord command reference
 
 | Group | Commands |
 |---|---|
 | Home | `/home` `/setup-channels` (admin) |
+| Pricing | `/pricing watch` `/pricing unwatch` (admin) `/pricing watchlist` `/pricing table` `/pricing refresh` |
 | Inventory | `/buy` `/stock` `/phone` `/edit-phone` `/move` `/status` `/fault` |
 | Testing | `/testing` `/test` `/test-result` |
 | Donors | `/donor` `/donors` `/teardown` `/donor-parts` `/allocate-cost` |
@@ -277,7 +357,7 @@ message in `#home` so it's always the first thing you see.
 | eBay | `/list` `/listing` `/ebay-sync` `/ebay-status` |
 | Finance | `/report` `/stock-value` `/profit` `/sales` `/expenses` |
 | Search | `/search` |
-| Config (admin only) | `/config business` `/config users` `/config channels` `/config locations` `/config tests` `/config part-types` `/config phone-models` `/config expense-types` `/config statuses` `/config thresholds` `/config pricing` `/config ebay` `/config sheets` `/config reset-defaults` |
+| Config (admin only) | `/config business` `/config users` `/config channels` `/config locations` `/config tests` `/config part-types` `/config phone-models` `/config expense-types` `/config statuses` `/config thresholds` `/config pricing-rules` `/config ebay` `/config sheets` `/config reset-defaults` |
 | Demo | `/demo` (development only) |
 
 Buy/donor/listing flows use **modals** so you never type raw JSON.
@@ -287,7 +367,7 @@ repair) require an explicit **Confirm/Cancel** button press.
 
 ---
 
-## 11. Backups
+## 12. Backups
 
 ```bash
 # Manual backup
@@ -348,7 +428,7 @@ docker compose up -d
 
 ---
 
-## 12. Updating the application
+## 13. Updating the application
 
 ```bash
 git pull            # or copy over your updated files
@@ -376,7 +456,7 @@ The same check also runs as part of `pytest` (`tests/test_command_tree.py`).
 
 ---
 
-## 13. Demo data
+## 14. Demo data
 
 ```
 /demo
@@ -394,7 +474,7 @@ without waiting for real data.
 
 ---
 
-## 14. Tests
+## 15. Tests
 
 ```bash
 createdb iphoneflip_test
@@ -413,7 +493,7 @@ idempotent Google Sheets sync.
 
 ---
 
-## 15. Troubleshooting
+## 16. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
@@ -427,7 +507,7 @@ idempotent Google Sheets sync.
 
 ---
 
-## 16. Known limitations of this MVP
+## 17. Known limitations of this MVP
 
 In the spirit of not overbuilding and being upfront about scope, a few
 things are intentionally minimal in this first pass and would be natural

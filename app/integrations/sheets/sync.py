@@ -177,7 +177,7 @@ async def sync_all(session: AsyncSession, client: SheetsClient, actor_discord_id
     await log_event(
         session,
         event_type=InventoryEventType.SHEETS_SYNCED.value,
-        entity_type="EXPENSE",  # ledger requires an entity_type; this is a system-level event
+        entity_type="SYSTEM",
         entity_id="SYSTEM",
         actor_discord_id=actor_discord_id or None,
         new_state={k: {"updated": v[0], "appended": v[1]} for k, v in results.items()},
