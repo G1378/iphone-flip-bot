@@ -83,14 +83,14 @@ class EbayClient(EbayClientInterface):
             resp = await client.post(_auth_url(), data=data, auth=auth,
                                       headers={"Content-Type": "application/x-www-form-urlencoded"})
         if resp.status_code != 200:
-    logger.error(
-        "eBay app token request failed: status=%s response=%s",
-        resp.status_code,
-        resp.text[:1000],
-    )
-    raise EbayApiError(
-        f"eBay app token request failed (status {resp.status_code})"
-    )
+            logger.error(
+                "eBay app token request failed: status=%s response=%s",
+                resp.status_code,
+                resp.text[:1000],
+            )
+            raise EbayApiError(
+                f"eBay app token request failed (status {resp.status_code})"
+            )
 
         payload = resp.json()
         self._access_token = payload["access_token"]
