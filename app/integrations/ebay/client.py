@@ -26,6 +26,9 @@ PRODUCTION_BASE = "https://api.ebay.com"
 SANDBOX_AUTH = "https://api.sandbox.ebay.com/identity/v1/oauth2/token"
 PRODUCTION_AUTH = "https://api.ebay.com/identity/v1/oauth2/token"
 
+BROWSE_SCOPE = "https://api.ebay.com/oauth/api_scope"
+INSIGHTS_SCOPE = "https://api.ebay.com/oauth/api_scope/buy.marketplace.insights"
+
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
@@ -58,8 +61,8 @@ class EbayClient(EbayClientInterface):
         self.buy_apis_configured = settings.ebay_buy_apis_configured
         self._access_token: Optional[str] = None
         self._token_expires_at: Optional[dt.datetime] = None
-        self._app_access_token: Optional[str] = None
-        self._app_token_expires_at: Optional[dt.datetime] = None
+        # app-level (client-credentials) tokens, cached per scope set
+        self._app_tokens: dict[str, tuple[str, dt.datetime]] = {}
         self._http = httpx.AsyncClient(base_url=_base_url(), timeout=20.0)
 
     async def aclose(self) -> None:
@@ -98,35 +101,39 @@ class EbayClient(EbayClientInterface):
         self._token_expires_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=expires_in - 60)
         return self._access_token
 
-    async def _get_app_access_token(self) -> str:
-        """Client-credentials grant for the Buy APIs (Browse, Marketplace
-        Insights). No user consent/refresh token needed - just the app's
-        own client_id/client_secret - so pricing lookups work even before
-        scripts/ebay_oauth_setup.py has been run for the Sell APIs."""
-        if self._app_access_token and self._app_token_expires_at and dt.datetime.now(dt.timezone.utc) < self._app_token_expires_at:
-            return self._app_access_token
+    async def _get_app_access_token(self, scope: str = BROWSE_SCOPE) -> str:
+        """Client-credentials grant for the Buy APIs. No user consent or
+        refresh token needed - just the app's own client_id/client_secret.
 
-        auth = (settings.ebay_client_id, settings.ebay_client_secret)
-        data = {
-            "grant_type": "client_credentials",
-            "scope": "https://api.ebay.com/oauth/api_scope/buy.marketplace.insights "
-                     "https://api.ebay.com/oauth/api_scope",
-        }
+        Scopes are requested separately: the basic api_scope (enough for the
+        Browse API) is available to every app, whereas
+        buy.marketplace.insights is restricted. Asking for a scope the app
+        isn't approved for makes eBay reject the *whole* request with 400
+        invalid_scope, so the two must never be combined in one call."""
+        cached = self._app_tokens.get(scope)
+        if cached and dt.datetime.now(dt.timezone.utc) < cached[1]:
+            return cached[0]
+
+        auth = (settings.ebay_client_id.strip(), settings.ebay_client_secret.strip())
+        data = {"grant_type": "client_credentials", "scope": scope}
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(_auth_url(), data=data, auth=auth,
                                       headers={"Content-Type": "application/x-www-form-urlencoded"})
         if resp.status_code != 200:
-            logger.error("eBay app token request failed with status %s", resp.status_code)
+            logger.error(
+                "eBay app token request failed: status=%s scope=%s response=%s",
+                resp.status_code, scope, resp.text[:500],
+            )
             raise EbayApiError(f"eBay app token request failed (status {resp.status_code})")
 
         payload = resp.json()
-        self._app_access_token = payload["access_token"]
         expires_in = int(payload.get("expires_in", 7200))
-        self._app_token_expires_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=expires_in - 60)
-        return self._app_access_token
+        expires_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=expires_in - 60)
+        self._app_tokens[scope] = (payload["access_token"], expires_at)
+        return payload["access_token"]
 
-    async def _app_headers(self) -> dict[str, str]:
-        token = await self._get_app_access_token()
+    async def _app_headers(self, scope: str = BROWSE_SCOPE) -> dict[str, str]:
+        token = await self._get_app_access_token(scope)
         return {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -166,11 +173,11 @@ class EbayClient(EbayClientInterface):
         wait=wait_exponential(multiplier=1, min=1, max=20),
         retry=retry_if_exception_type(_RetryableHttpError),
     )
-    async def _app_request(self, method: str, path: str, **kwargs) -> httpx.Response:
+    async def _app_request(self, method: str, path: str, scope: str = BROWSE_SCOPE, **kwargs) -> httpx.Response:
         """Same as _request but authenticated with the app-level (client
         credentials) token, for the Buy APIs used by pricing lookups."""
         headers = kwargs.pop("headers", {})
-        headers.update(await self._app_headers())
+        headers.update(await self._app_headers(scope))
         resp = await self._http.request(method, path, headers=headers, **kwargs)
         if resp.status_code in RETRYABLE_STATUS:
             raise _RetryableHttpError(resp)
@@ -318,7 +325,10 @@ class EbayClient(EbayClientInterface):
             "limit": "100",
         }
         try:
-            resp = await self._app_request("GET", "/buy/marketplace_insights/v1_beta/item_sales/search", params=params)
+            resp = await self._app_request(
+                "GET", "/buy/marketplace_insights/v1_beta/item_sales/search",
+                scope=INSIGHTS_SCOPE, params=params,
+            )
         except EbayApiError:
             return None
 
