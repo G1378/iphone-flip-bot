@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
@@ -10,11 +11,15 @@ from discord.ext import commands
 
 from app.bot.auth import require_admin, require_authorized
 from app.bot.embeds import error_embed, success_embed
+from app.config import settings
 from app.db import session_scope
+from app.jobs.sheets_sync_job import run_sheets_sync, sync_lock
 from app.services import config_service
 from app.services import donors as donors_service
 from app.services import finance as finance_service
 from app.services import phones as phones_service
+
+logger = logging.getLogger(__name__)
 
 # (purpose key, channel name, colour emoji used in name, cheat-sheet of commands)
 CHANNEL_PLAN: list[tuple[str, str, str]] = [
@@ -236,6 +241,47 @@ class HomeView(discord.ui.View):
         e.add_field(name="Phones purchased", value=str(r.phones_purchased), inline=True)
         e.add_field(name="Avg profit/phone", value=f"{currency}{r.avg_profit_per_phone}", inline=True)
         await interaction.followup.send(embed=e, ephemeral=True)
+
+    @discord.ui.button(label="🔄 Sync Sheets", style=discord.ButtonStyle.primary, row=3, custom_id="home:sheets_sync_now")
+    async def sync_sheets(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_admin(interaction):
+            return
+        bot = interaction.client
+        if not bot.sheets_client.configured:
+            await interaction.response.send_message(
+                embed=error_embed("Google Sheets isn't configured yet. See `/config sheets`."), ephemeral=True)
+            return
+        if sync_lock.locked():
+            await interaction.response.send_message(
+                "A Sheets sync is already running. Try again in a minute.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        status = bot.job_scheduler.state.sheets if bot.job_scheduler else None
+        if status:
+            status.last_run_at = dt.datetime.now(dt.timezone.utc)
+        try:
+            async with session_scope() as session:
+                results = await run_sheets_sync(session, bot.sheets_client, interaction.user.id)
+        except Exception as e:  # noqa: BLE001 - report to the user, never crash the button
+            logger.exception("Manual Sheets sync failed")
+            if status:
+                status.last_success = False
+                status.last_error = f"Unexpected error: {e}"
+            await interaction.followup.send(
+                embed=error_embed(f"Sheets sync failed: {str(e)[:300]}"), ephemeral=True)
+            return
+
+        updated = sum(u for u, _ in results.values())
+        added = sum(a for _, a in results.values())
+        summary = f"{updated} updated, {added} added across {len(results)} sheets"
+        if status:
+            status.last_success = True
+            status.last_error = None
+            status.last_summary = summary
+        url = f"https://docs.google.com/spreadsheets/d/{settings.google_sheets_spreadsheet_id}"
+        await interaction.followup.send(
+            embed=success_embed("Sheets synced", f"{summary}.\n[Open the spreadsheet]({url})"), ephemeral=True)
 
 
 class HomeCog(commands.Cog):
