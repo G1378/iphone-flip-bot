@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 
@@ -168,9 +169,11 @@ async def sync_all(session: AsyncSession, client: SheetsClient, actor_discord_id
 
     results: dict[str, tuple[int, int]] = {}
     for name, headers in SHEET_SPECS.items():
-        ws = client.get_or_create_worksheet(name, headers)
+        # gspread is synchronous; run it in a worker thread so the Discord
+        # event loop (heartbeats, slash commands) is never blocked.
+        ws = await asyncio.to_thread(client.get_or_create_worksheet, name, headers)
         rows = await ROW_BUILDERS[name](session)
-        results[name] = client.upsert_rows(ws, rows)
+        results[name] = await asyncio.to_thread(client.upsert_rows, ws, rows)
 
     await _sync_dashboard(session, client)
 
@@ -186,7 +189,7 @@ async def sync_all(session: AsyncSession, client: SheetsClient, actor_discord_id
 
 
 async def _sync_dashboard(session: AsyncSession, client: SheetsClient) -> None:
-    ws = client.get_or_create_worksheet("DASHBOARD", ["metric", "value", "as_of"])
+    ws = await asyncio.to_thread(client.get_or_create_worksheet, "DASHBOARD", ["metric", "value", "as_of"])
     stock = await finance.stock_value(session)
     today = dt.date.today()
     month_start = today.replace(day=1)
@@ -202,4 +205,4 @@ async def _sync_dashboard(session: AsyncSession, client: SheetsClient) -> None:
         ["month_to_date_phones_sold", str(month_report.phones_sold), str(today)],
         ["month_to_date_roi_pct", str(month_report.roi_pct), str(today)],
     ]
-    client.upsert_rows(ws, rows, id_col_index=0)
+    await asyncio.to_thread(client.upsert_rows, ws, rows, 0)

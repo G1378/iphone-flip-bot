@@ -63,6 +63,9 @@ class EbayClient(EbayClientInterface):
         self._token_expires_at: Optional[dt.datetime] = None
         # app-level (client-credentials) tokens, cached per scope set
         self._app_tokens: dict[str, tuple[str, dt.datetime]] = {}
+        # Set once eBay says this app isn't granted Marketplace Insights, so
+        # we don't burn a failing token request on every lookup.
+        self._insights_unavailable_until: Optional[dt.datetime] = None
         self._http = httpx.AsyncClient(base_url=_base_url(), timeout=20.0)
 
     async def aclose(self) -> None:
@@ -120,7 +123,8 @@ class EbayClient(EbayClientInterface):
             resp = await client.post(_auth_url(), data=data, auth=auth,
                                       headers={"Content-Type": "application/x-www-form-urlencoded"})
         if resp.status_code != 200:
-            logger.error(
+            log = logger.warning if scope == INSIGHTS_SCOPE else logger.error
+            log(
                 "eBay app token request failed: status=%s scope=%s response=%s",
                 resp.status_code, scope, resp.text[:500],
             )
@@ -319,6 +323,9 @@ class EbayClient(EbayClientInterface):
     # ------------------------------------------------------------------
     async def get_sold_price_stats(self, query: str, condition_ids: list[str], days_back: int = 90) -> Optional[PriceStats]:
         self._ensure_buy_apis_configured()
+        now = dt.datetime.now(dt.timezone.utc)
+        if self._insights_unavailable_until and now < self._insights_unavailable_until:
+            return None
         params = {
             "q": query,
             "filter": f"conditionIds:{{{'|'.join(condition_ids)}}}",
@@ -330,6 +337,10 @@ class EbayClient(EbayClientInterface):
                 scope=INSIGHTS_SCOPE, params=params,
             )
         except EbayApiError:
+            # Token request refused (typically invalid_scope: app not approved
+            # for Marketplace Insights). Skip Insights for 24h and fall back.
+            self._insights_unavailable_until = now + dt.timedelta(hours=24)
+            logger.warning("Marketplace Insights unavailable for this app - using active-listing estimates for 24h.")
             return None
 
         if resp.status_code == 403:
