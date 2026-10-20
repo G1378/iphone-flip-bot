@@ -9,7 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from app.bot.auth import require_admin, require_authorized
+from app.bot.auth import _is_admin, require_admin, require_authorized
 from app.bot.embeds import error_embed, success_embed
 from app.config import settings
 from app.db import session_scope
@@ -168,8 +168,8 @@ class HomeView(discord.ui.View):
                     break  # keep well within Discord's 5-row limit
 
     async def _require_admin(self, interaction: discord.Interaction) -> bool:
-        async with session_scope() as session:
-            ok = await config_service.is_admin(session, interaction.user.id)
+        # Same rule as the slash commands: .env bootstrap admins OR database admins.
+        ok = await _is_admin(interaction.user.id)
         if not ok:
             await interaction.response.send_message("This action requires admin privileges.", ephemeral=True)
         return ok
