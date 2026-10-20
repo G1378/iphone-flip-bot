@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import discord
 from discord.ext import commands
 
+from app.bot.autodefer import AutoDeferTree, install_send_message_fallback, monitor_event_loop_lag
 from app.config import settings
 from app.db import session_scope
 from app.integrations.ebay import get_ebay_client
@@ -35,11 +37,12 @@ class FlipBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.message_content = False  # bot is slash-command only, no need to read messages
-        super().__init__(command_prefix="!disabled-", intents=intents)
+        super().__init__(command_prefix="!disabled-", intents=intents, tree_cls=AutoDeferTree)
 
         self.ebay_client = get_ebay_client()
         self.sheets_client = SheetsClient()
         self.job_scheduler: JobScheduler | None = None
+        self._lag_monitor_task: asyncio.Task | None = None
 
     async def setup_hook(self) -> None:
         # Ensure default configuration exists before any command runs.
@@ -58,6 +61,9 @@ class FlipBot(commands.Bot):
         else:
             synced = await self.tree.sync()
             logger.info("Synced %d global commands (may take up to 1h to propagate)", len(synced))
+
+        install_send_message_fallback()
+        self._lag_monitor_task = asyncio.create_task(monitor_event_loop_lag())
 
         self.job_scheduler = JobScheduler(self.ebay_client, self.sheets_client, self._notify_channels)
         self.job_scheduler.start()
@@ -81,6 +87,8 @@ class FlipBot(commands.Bot):
         logger.info("Logged in as %s (id=%s)", self.user, self.user.id if self.user else "?")
 
     async def close(self) -> None:
+        if self._lag_monitor_task:
+            self._lag_monitor_task.cancel()
         if self.job_scheduler:
             await self.job_scheduler.shutdown()
         if hasattr(self.ebay_client, "aclose"):
