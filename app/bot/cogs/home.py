@@ -109,9 +109,10 @@ class AddLocationModal(discord.ui.Modal, title="Add a storage location"):
     zone = discord.ui.TextInput(label="Zone / shelf (e.g. Shelf B)", required=False, max_length=50)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         async with session_scope() as session:
             await config_service.add_location(session, self.code.value, zone=self.zone.value or None)
-        await interaction.response.send_message(embed=success_embed(f"Location {self.code.value.upper()} added."), ephemeral=True)
+        await interaction.followup.send(embed=success_embed(f"Location {self.code.value.upper()} added."), ephemeral=True)
 
 
 class AuthorizeUserSelect(discord.ui.UserSelect):
@@ -168,32 +169,33 @@ class HomeView(discord.ui.View):
             await interaction.response.send_message("This action requires admin privileges.", ephemeral=True)
         return ok
 
-    @discord.ui.button(label="⚙️ Business Settings", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="⚙️ Business Settings", style=discord.ButtonStyle.primary, row=2, custom_id="home:business_settings")
     async def business_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._require_admin(interaction):
             return
         await interaction.response.send_modal(BusinessSettingsModal())
 
-    @discord.ui.button(label="📍 Add Location", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="📍 Add Location", style=discord.ButtonStyle.primary, row=2, custom_id="home:add_location")
     async def add_location(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._require_admin(interaction):
             return
         await interaction.response.send_modal(AddLocationModal())
 
-    @discord.ui.button(label="👥 Authorize User", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="👥 Authorize User", style=discord.ButtonStyle.primary, row=2, custom_id="home:authorize_user")
     async def authorize_user(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._require_admin(interaction):
             return
         await interaction.response.send_message("Pick a user to authorize:", view=AuthorizeUserView(interaction.user.id), ephemeral=True)
 
-    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=2, custom_id="home:refresh")
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()  # acknowledge within Discord's 3s limit
         async with session_scope() as session:
             embed = await _build_home_embed(session, interaction.client)
             view = await _build_home_view(session, interaction.guild_id, interaction.user.id)
-        await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.edit_original_response(embed=embed, view=view)
 
-    @discord.ui.button(label="eBay Status", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="eBay Status", style=discord.ButtonStyle.secondary, row=3, custom_id="home:ebay_status")
     async def ebay_status(self, interaction: discord.Interaction, button: discord.ui.Button):
         bot = interaction.client
         configured = bot.ebay_client.configured
@@ -207,7 +209,7 @@ class HomeView(discord.ui.View):
             e.add_field(name="Result", value=job.last_summary or job.last_error or "—", inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
-    @discord.ui.button(label="Sheets Status", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="Sheets Status", style=discord.ButtonStyle.secondary, row=3, custom_id="home:sheets_status")
     async def sheets_status(self, interaction: discord.Interaction, button: discord.ui.Button):
         bot = interaction.client
         configured = bot.sheets_client.configured
@@ -219,8 +221,9 @@ class HomeView(discord.ui.View):
             e.add_field(name="Result", value=job.last_summary or job.last_error or "—", inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
-    @discord.ui.button(label="📊 Monthly Report", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="📊 Monthly Report", style=discord.ButtonStyle.secondary, row=3, custom_id="home:monthly_report")
     async def monthly_report(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         today = dt.date.today()
         async with session_scope() as session:
             r = await finance_service.period_report(session, today.replace(day=1), today)
@@ -232,12 +235,18 @@ class HomeView(discord.ui.View):
         e.add_field(name="Phones sold", value=str(r.phones_sold), inline=True)
         e.add_field(name="Phones purchased", value=str(r.phones_purchased), inline=True)
         e.add_field(name="Avg profit/phone", value=f"{currency}{r.avg_profit_per_phone}", inline=True)
-        await interaction.response.send_message(embed=e, ephemeral=True)
+        await interaction.followup.send(embed=e, ephemeral=True)
 
 
 class HomeCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    async def cog_load(self) -> None:
+        # Register the dashboard buttons so they keep working on old /home
+        # messages after the bot restarts. The callbacks don't depend on the
+        # guild/channel data, so an empty view is enough.
+        self.bot.add_view(HomeView(0, 0, {}))
 
     @app_commands.command(name="setup-channels", description="[Admin] Create the standard set of channels for this bot")
     @require_admin()

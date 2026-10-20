@@ -15,44 +15,101 @@ from app.services import config_service
 from app.services import pricing as pricing_service
 
 
-def _fmt_obs(obs) -> str:
-    if not obs:
-        return "no data yet"
-    source_tag = "sold" if obs.source.value == "SOLD" else "est."
-    return f"£{obs.median_price} ({source_tag}, n={obs.sample_count})"
+def _pounds(value) -> str:
+    return f"£{value:,.0f}"
 
 
-async def _build_table_text(session) -> str:
+def _nice_model(name: str) -> str:
+    return name.replace("Iphone", "iPhone").replace("iphone", "iPhone")
+
+
+def _basis(obs) -> str:
+    kind = "recent sales" if obs.source.value == "SOLD" else "current eBay listings"
+    return f"based on {obs.sample_count} {kind}"
+
+
+def _entry_text(rec) -> str:
+    lines: list[str] = []
+
+    # --- Working phone ---
+    lines.append("**Working phone**")
+    if rec.used_observation is None:
+        lines.append("No price data yet. Run `/pricing refresh`.")
+    else:
+        lines.append(f"Sells for about **{_pounds(rec.used_observation.median_price)}** ({_basis(rec.used_observation)})")
+        buy = rec.recommended_buy_used
+        if buy is not None and buy > 0:
+            lines.append(f"✅ Buy for up to **{_pounds(buy)}**")
+        else:
+            lines.append("❌ Not worth buying at today's prices")
+
+    # --- Faulty phone ---
+    lines.append("")
+    lines.append("**Faulty / for parts**")
+    if rec.faulty_observation is None:
+        lines.append("No price data yet. Run `/pricing refresh`.")
+    else:
+        lines.append(f"Sells for about **{_pounds(rec.faulty_observation.median_price)}** as-is ({_basis(rec.faulty_observation)})")
+    buy_f = rec.recommended_buy_faulty
+    if rec.used_observation is not None:
+        repair = _pounds(rec.repair_cost_assumption)
+        repair_note = "your average repair cost" if rec.repair_cost_is_historical else "assumed repair cost"
+        if buy_f is None or buy_f <= 0:
+            lines.append("❌ Not worth buying at today's prices")
+        else:
+            lines.append(f"✅ Buy for up to **{_pounds(buy_f)}** if you repair it and resell it as a working phone ({repair_note}: {repair})")
+            if rec.faulty_observation is not None and buy_f > rec.faulty_observation.median_price:
+                lines.append(
+                    f"⚠️ That is more than faulty ones normally sell for. "
+                    f"Only pay it if the repair really costs {repair} or less."
+                )
+    return "\n".join(lines)
+
+
+async def _build_table_embeds(session) -> list[discord.Embed]:
     entries = await pricing_service.list_watchlist(session)
     if not entries:
-        return "Nothing on the watchlist yet. Use /pricing watch to add a model."
+        return [discord.Embed(
+            title="📈 Pricing",
+            description="Nothing on the watchlist yet. Use `/pricing watch` to add a phone model.",
+            colour=discord.Colour.blue(),
+        )]
 
-    lines = [f"{'MODEL':<28}{'STORAGE':<9}{'USED':<20}{'FAULTY':<20}{'BUY(used)':<12}{'BUY(faulty)':<12}"]
-    lines.append("-" * len(lines[0]))
-    for entry in entries:
-        rec = await pricing_service.compute_recommendation(session, entry)
-        model_name = entry.phone_model.display_name()[:27]
-        storage = entry.storage or "any"
-        used_txt = _fmt_obs(rec.used_observation)[:19]
-        faulty_txt = _fmt_obs(rec.faulty_observation)[:19]
-        buy_used = f"£{rec.recommended_buy_used}" if rec.recommended_buy_used is not None else "—"
-        buy_faulty = f"£{rec.recommended_buy_faulty}" if rec.recommended_buy_faulty is not None else "—"
-        lines.append(f"{model_name:<28}{storage:<9}{used_txt:<20}{faulty_txt:<20}{buy_used:<12}{buy_faulty:<12}")
-    return "\n".join(lines)
+    embeds: list[discord.Embed] = []
+    for i in range(0, len(entries), 10):  # keep each embed comfortably under Discord's size limits
+        embed = discord.Embed(
+            title="📈 Pricing" if i == 0 else "📈 Pricing (continued)",
+            colour=discord.Colour.blue(),
+        )
+        for entry in entries[i:i + 10]:
+            rec = await pricing_service.compute_recommendation(session, entry)
+            storage = entry.storage or "any storage"
+            embed.add_field(
+                name=f"📱 {_nice_model(entry.phone_model.display_name())} · {storage}",
+                value=_entry_text(rec),
+                inline=False,
+            )
+        embeds.append(embed)
+
+    embeds[-1].set_footer(text=(
+        "\"Buy for up to\" is the most you should pay and still make your minimum profit after "
+        "eBay fees and postage. \"Sells for about\" is the median price."
+    ))
+    return embeds
 
 
 class RefreshButton(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="🔄 Refresh now", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="🔄 Refresh now", style=discord.ButtonStyle.primary, custom_id="pricing:refresh")
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(thinking=True)
         bot = interaction.client
         try:
             async with session_scope() as session:
                 await run_pricing_refresh(session, bot.ebay_client, interaction.user.id)
-                table_text = await _build_table_text(session)
+                embeds = await _build_table_embeds(session)
         except EbayNotConfiguredError:
             await interaction.followup.send(embed=error_embed(
                 "eBay pricing isn't configured. Set EBAY_CLIENT_ID and EBAY_CLIENT_SECRET in `.env` "
@@ -63,9 +120,7 @@ class RefreshButton(discord.ui.View):
             await interaction.followup.send(embed=error_embed(f"eBay API error: {e}"))
             return
 
-        e = discord.Embed(title="📈 Pricing table", description=f"```\n{table_text}\n```", colour=discord.Colour.blue())
-        e.set_footer(text="Prices are medians. 'sold' = actual eBay sold comps, 'est.' = active-listing estimate (sold data unavailable).")
-        await interaction.followup.send(embed=e, view=RefreshButton())
+        await interaction.followup.send(embeds=embeds, view=RefreshButton())
 
 
 class PricingCog(commands.GroupCog, group_name="pricing"):
@@ -73,6 +128,11 @@ class PricingCog(commands.GroupCog, group_name="pricing"):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    async def cog_load(self) -> None:
+        # Re-register the Refresh button so it keeps working on old messages
+        # after the bot restarts.
+        self.bot.add_view(RefreshButton())
 
     @app_commands.command(name="watch", description="Add a phone model (and optionally storage) to the pricing watchlist")
     @require_admin()
@@ -112,10 +172,8 @@ class PricingCog(commands.GroupCog, group_name="pricing"):
     async def table(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
         async with session_scope() as session:
-            table_text = await _build_table_text(session)
-        e = discord.Embed(title="📈 Pricing table", description=f"```\n{table_text}\n```", colour=discord.Colour.blue())
-        e.set_footer(text="Prices are medians. 'sold' = actual eBay sold comps, 'est.' = active-listing estimate (sold data unavailable).")
-        await interaction.followup.send(embed=e, view=RefreshButton())
+            embeds = await _build_table_embeds(session)
+        await interaction.followup.send(embeds=embeds, view=RefreshButton())
 
     @app_commands.command(name="refresh", description="Refresh eBay pricing for every watched model now")
     @require_authorized()
