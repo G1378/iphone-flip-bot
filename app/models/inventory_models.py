@@ -169,6 +169,9 @@ class PhoneFault(Base, TimestampMixin):
     phone_id: Mapped[int] = mapped_column(ForeignKey("phones.id"), nullable=False)
     description: Mapped[str] = mapped_column(String(200), nullable=False)
     required_part_type_id: Mapped[Optional[int]] = mapped_column(ForeignKey("part_types.id"))
+    # Set when the fault was raised automatically by a failed test, so a later
+    # PASS on the same test can resolve it again.
+    test_definition_id: Mapped[Optional[int]] = mapped_column(ForeignKey("test_definitions.id"), nullable=True)
     status: Mapped[FaultStatus] = mapped_column(default=FaultStatus.OPEN)
     repair_id: Mapped[Optional[int]] = mapped_column(ForeignKey("repairs.id"))
     resolved_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))

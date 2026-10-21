@@ -91,6 +91,32 @@ DEFAULT_TEST_LABELS = {
     "water_damage_indicator": "Water Damage Indicator",
 }
 
+# Which part type normally fixes a failed test. Tests that are absent here
+# (water_damage_indicator) have no single fixing part: a failure is still
+# flagged on the phone but needs manual inspection. Admins can change any of
+# these with `/config tests`.
+DEFAULT_TEST_PART_TYPES = {
+    "touchscreen": "Screen",
+    "display": "Screen",
+    "true_tone": "Screen",
+    "face_id_touch_id": "Face ID Module",
+    "front_camera": "Front Camera",
+    "rear_cameras": "Rear Camera",
+    "microphone": "Charging Port / Flex",
+    "speakers": "Speaker",
+    "charging": "Charging Port / Flex",
+    "wireless_charging": "Back Glass",
+    "wifi": "Logic Board",
+    "bluetooth": "Logic Board",
+    "mobile_signal": "Logic Board",
+    "buttons": "Housing",
+    "vibration": "Vibration Motor",
+    "proximity_sensor": "Earpiece",
+    "ambient_light_sensor": "Earpiece",
+    "battery_health": "Battery",
+    "sim_esim": "SIM Tray",
+}
+
 DEFAULT_PART_TYPES = [
     "Screen", "Battery", "Rear Camera", "Front Camera", "Housing", "Back Glass",
     "Charging Port / Flex", "Speaker", "Earpiece", "Vibration Motor", "SIM Tray",

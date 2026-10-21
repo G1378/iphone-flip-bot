@@ -35,21 +35,58 @@ async def get_repair(session: AsyncSession, internal_id: str) -> Optional[Repair
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
+_ACTIVE_REPAIR_STATUSES = ["PLANNED", "PARTS_RESERVED", "IN_PROGRESS"]
+_OUTSTANDING_LINE_STATUSES = (RepairPartLineStatus.REQUIRED, RepairPartLineStatus.RESERVED)
+
+
+async def get_active_repair(session: AsyncSession, phone: Phone) -> Optional[Repair]:
+    """The phone's in-flight repair (PLANNED / PARTS_RESERVED / IN_PROGRESS), if any."""
+    stmt = (
+        select(Repair)
+        .where(Repair.phone_id == phone.id, Repair.status.in_(_ACTIVE_REPAIR_STATUSES))
+        .order_by(Repair.created_at.desc())
+    )
+    return (await session.execute(stmt)).scalars().first()
+
+
+def _attach_fault(repair: Repair, fault: PhoneFault) -> None:
+    """Link a fault to a repair and make sure its part is on the shopping list.
+
+    One outstanding line per part type: a cracked screen and a dead touch
+    layer both need the same single Screen, not two.
+    """
+    if fault not in repair.faults:
+        repair.faults.append(fault)
+    if not fault.required_part_type_id:
+        return
+    already_needed = any(
+        rp.required_part_type_id == fault.required_part_type_id and rp.status in _OUTSTANDING_LINE_STATUSES
+        for rp in repair.parts
+    )
+    if not already_needed:
+        repair.parts.append(
+            RepairPart(
+                required_part_type_id=fault.required_part_type_id,
+                quantity=1,
+                status=RepairPartLineStatus.REQUIRED,
+            )
+        )
+
+
+async def _open_faults(session: AsyncSession, phone: Phone) -> Sequence[PhoneFault]:
+    stmt = select(PhoneFault).where(PhoneFault.phone_id == phone.id, PhoneFault.status == FaultStatus.OPEN)
+    return (await session.execute(stmt)).scalars().all()
+
+
 async def create_repair_for_open_faults(session: AsyncSession, phone: Phone, actor_discord_id: int) -> Repair:
     """Create (or return existing PLANNED/IN_PROGRESS) repair covering all
     of a phone's currently OPEN faults, with one RepairPart requirement
-    line per fault that has a known required_part_type_id."""
-    existing_stmt = (
-        select(Repair)
-        .where(Repair.phone_id == phone.id, Repair.status.in_(["PLANNED", "PARTS_RESERVED", "IN_PROGRESS"]))
-        .order_by(Repair.created_at.desc())
-    )
-    existing = (await session.execute(existing_stmt)).scalar_one_or_none()
+    line per part type needed by those faults."""
+    existing = await get_active_repair(session, phone)
     if existing:
         return existing
 
-    open_faults_stmt = select(PhoneFault).where(PhoneFault.phone_id == phone.id, PhoneFault.status == FaultStatus.OPEN)
-    faults = (await session.execute(open_faults_stmt)).scalars().all()
+    faults = await _open_faults(session, phone)
 
     internal_id = await next_internal_id(session, "repair")
     # Initialise the collections explicitly (parts=[], faults=[]) so the
@@ -66,15 +103,7 @@ async def create_repair_for_open_faults(session: AsyncSession, phone: Phone, act
         # in-memory repair.faults / repair.parts collections correctly
         # populated for the object we're about to return, without needing
         # an extra async refresh() round trip or a fresh re-query.
-        repair.faults.append(fault)
-        if fault.required_part_type_id:
-            repair.parts.append(
-                RepairPart(
-                    required_part_type_id=fault.required_part_type_id,
-                    quantity=1,
-                    status=RepairPartLineStatus.REQUIRED,
-                )
-            )
+        _attach_fault(repair, fault)
     await session.flush()
 
     await log_event(
@@ -88,6 +117,46 @@ async def create_repair_for_open_faults(session: AsyncSession, phone: Phone, act
         new_state={"faults": [f.description for f in faults]},
     )
     return repair
+
+
+async def sync_repair_with_open_faults(session: AsyncSession, phone: Phone, actor_discord_id: int) -> Repair:
+    """Make sure the phone's active repair covers every OPEN fault.
+
+    Creates the repair if there isn't one; otherwise adds any open fault
+    (and its required part) that the existing repair doesn't know about yet.
+    Used when new faults appear after a repair was already planned, e.g. a
+    further test failing during testing.
+    """
+    repair = await get_active_repair(session, phone)
+    if repair is None:
+        return await create_repair_for_open_faults(session, phone, actor_discord_id)
+    for fault in await _open_faults(session, phone):
+        if fault.repair_id != repair.id:
+            _attach_fault(repair, fault)
+    await session.flush()
+    return repair
+
+
+async def release_fault_from_repair(session: AsyncSession, fault: PhoneFault) -> None:
+    """Called when a fault is resolved before the repair happens (e.g. the
+    test it came from now passes). Cancels the repair's still-unfulfilled
+    line for that part type, unless another open fault on the same repair
+    still needs that part. Reserved/installed lines are left alone."""
+    if not fault.repair_id or not fault.required_part_type_id:
+        return
+    repair = await session.get(Repair, fault.repair_id)
+    if repair is None or repair.status not in _ACTIVE_REPAIR_STATUSES:
+        return
+    still_needed = any(
+        f.id != fault.id and f.status == FaultStatus.OPEN and f.required_part_type_id == fault.required_part_type_id
+        for f in repair.faults
+    )
+    if still_needed:
+        return
+    for rp in repair.parts:
+        if rp.required_part_type_id == fault.required_part_type_id and rp.status == RepairPartLineStatus.REQUIRED:
+            rp.status = RepairPartLineStatus.CANCELLED
+    await session.flush()
 
 
 @dataclass

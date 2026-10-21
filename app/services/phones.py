@@ -154,8 +154,11 @@ async def edit_phone(session: AsyncSession, phone: Phone, actor_discord_id: int,
 
 
 async def add_fault(session: AsyncSession, phone: Phone, description: str, actor_discord_id: int,
-                     required_part_type_id: Optional[int] = None) -> PhoneFault:
-    fault = PhoneFault(phone_id=phone.id, description=description, required_part_type_id=required_part_type_id)
+                     required_part_type_id: Optional[int] = None,
+                     test_definition_id: Optional[int] = None) -> PhoneFault:
+    fault = PhoneFault(phone_id=phone.id, description=description,
+                       required_part_type_id=required_part_type_id,
+                       test_definition_id=test_definition_id)
     session.add(fault)
     await session.flush()
     await log_event(

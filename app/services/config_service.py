@@ -43,15 +43,23 @@ async def seed_defaults_if_empty(session: AsyncSession) -> None:
                     )
                 )
 
-    if not (await session.execute(select(TestDefinition.id).limit(1))).first():
-        for i, code in enumerate(d.DEFAULT_TEST_DEFINITIONS):
-            session.add(
-                TestDefinition(code=code, name=d.DEFAULT_TEST_LABELS[code], sort_order=i)
-            )
-
+    # Part types first: default tests point at them (test -> fixing part).
     if not (await session.execute(select(PartTypeConfig.id).limit(1))).first():
         for name in d.DEFAULT_PART_TYPES:
             session.add(PartTypeConfig(name=name, category=None))
+        await session.flush()
+
+    if not (await session.execute(select(TestDefinition.id).limit(1))).first():
+        part_ids = {
+            p.name: p.id for p in (await session.execute(select(PartTypeConfig))).scalars().all()
+        }
+        for i, code in enumerate(d.DEFAULT_TEST_DEFINITIONS):
+            session.add(
+                TestDefinition(
+                    code=code, name=d.DEFAULT_TEST_LABELS[code], sort_order=i,
+                    part_type_id=part_ids.get(d.DEFAULT_TEST_PART_TYPES.get(code, "")),
+                )
+            )
 
     if not (await session.execute(select(ConditionGrade.id).limit(1))).first():
         for code, label, order in d.DEFAULT_CONDITION_GRADES:
@@ -324,11 +332,40 @@ async def list_test_definitions(session: AsyncSession) -> Sequence[TestDefinitio
     ).scalars().all()
 
 
-async def add_test_definition(session: AsyncSession, code: str, name: str) -> TestDefinition:
-    row = TestDefinition(code=code.lower().replace(" ", "_"), name=name, sort_order=999)
+async def add_test_definition(session: AsyncSession, code: str, name: str,
+                               part_type_id: Optional[int] = None) -> TestDefinition:
+    row = TestDefinition(code=code.lower().replace(" ", "_"), name=name, sort_order=999,
+                         part_type_id=part_type_id)
     session.add(row)
     await session.flush()
     return row
+
+
+async def find_test_definition(session: AsyncSession, name: str) -> Optional[TestDefinition]:
+    """Active test by display name or code (case-insensitive)."""
+    key = name.strip().lower()
+    for t in await list_test_definitions(session):
+        if t.name.lower() == key or t.code == key.replace(" ", "_"):
+            return t
+    return None
+
+
+async def find_part_type(session: AsyncSession, name: str) -> Optional[PartTypeConfig]:
+    """Active part type by name (case-insensitive). Does not create one."""
+    key = name.strip().lower()
+    for p in await list_part_types(session):
+        if p.name.lower() == key:
+            return p
+    return None
+
+
+async def set_test_part_type(session: AsyncSession, test: TestDefinition,
+                              part_type: Optional[PartTypeConfig]) -> TestDefinition:
+    """Set (or clear, with None) which part type fixes this test when it fails."""
+    test.part_type_id = part_type.id if part_type else None
+    test.part_type = part_type
+    await session.flush()
+    return test
 
 
 async def list_condition_grades(session: AsyncSession) -> Sequence[ConditionGrade]:

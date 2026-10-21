@@ -98,21 +98,47 @@ class ConfigCog(commands.GroupCog, group_name="config"):
                 await interaction.response.send_message(embed=error_embed("Locations are soft-deactivated by convention only; not implemented for remove in this MVP."), ephemeral=True)
 
     # ------------------------------------------------------------------
-    @app_commands.command(name="tests", description="Manage the phone testing checklist")
+    @app_commands.command(name="tests", description="Manage the phone testing checklist and which part fixes each test")
+    @app_commands.describe(
+        name="Test name",
+        part_type="Part flagged as needed when this test fails ('none' to clear). Re-run add on an existing test to change it.",
+    )
     @app_commands.choices(action=ADD_REMOVE_LIST)
     @require_admin()
-    async def tests(self, interaction: discord.Interaction, action: app_commands.Choice[str], name: Optional[str] = None):
+    async def tests(self, interaction: discord.Interaction, action: app_commands.Choice[str],
+                    name: Optional[str] = None, part_type: Optional[str] = None):
         async with session_scope() as session:
             if action.value == "add":
                 if not name:
                     await interaction.response.send_message(embed=error_embed("Provide a test name."), ephemeral=True)
                     return
-                await config_service.add_test_definition(session, name, name)
-                await interaction.response.send_message(embed=success_embed(f"Added test '{name}' to the checklist."))
+                part = None
+                if part_type and part_type.strip().lower() not in ("none", "-"):
+                    part = await config_service.find_part_type(session, part_type)
+                    if not part:
+                        valid = ", ".join(p.name for p in await config_service.list_part_types(session))
+                        await interaction.response.send_message(
+                            embed=error_embed(f"Unknown part type `{part_type}`. Known part types: {valid}"), ephemeral=True)
+                        return
+                existing = await config_service.find_test_definition(session, name)
+                if existing:
+                    if part_type is None:
+                        await interaction.response.send_message(
+                            embed=error_embed(f"'{existing.name}' is already on the checklist. Pass `part_type` to change the part it flags."), ephemeral=True)
+                        return
+                    await config_service.set_test_part_type(session, existing, part)
+                    msg = f"'{existing.name}' now flags **{part.name}** when it fails." if part else f"'{existing.name}' no longer maps to a part."
+                    await interaction.response.send_message(embed=success_embed(msg))
+                    return
+                await config_service.add_test_definition(session, name, name, part_type_id=part.id if part else None)
+                extra = f" (flags **{part.name}** when it fails)" if part else ""
+                await interaction.response.send_message(embed=success_embed(f"Added test '{name}' to the checklist{extra}."))
             elif action.value == "list":
                 defs = await config_service.list_test_definitions(session)
                 e = discord.Embed(title="🧪 Testing checklist", colour=discord.Colour.blue())
-                e.description = "\n".join(f"• {d.name}" for d in defs) or "None configured."
+                e.description = "\n".join(
+                    f"• {d.name} → {d.part_type.name if d.part_type else '_no part_'}" for d in defs
+                )[:4000] or "None configured."
                 await interaction.response.send_message(embed=e)
             else:
                 if not name:

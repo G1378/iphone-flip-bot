@@ -140,6 +140,14 @@ class TestDefinition(Base, TimestampMixin):
     sort_order: Mapped[int] = mapped_column(default=0)
     active: Mapped[bool] = mapped_column(default=True)
 
+    # The part type normally needed to fix this test if it fails. When a
+    # phone fails the test, this is the part flagged as required. NULL means
+    # "no single part fixes this" (e.g. water damage) - the failure is still
+    # recorded and flagged, just without a part.
+    part_type_id: Mapped[Optional[int]] = mapped_column(ForeignKey("part_types.id"), nullable=True)
+
+    part_type: Mapped[Optional["PartTypeConfig"]] = relationship(lazy="selectin")
+
 
 class PricingRule(Base, TimestampMixin):
     """Target margin / thresholds, optionally scoped to a specific phone model.
