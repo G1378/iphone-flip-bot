@@ -83,6 +83,9 @@ async def seed_defaults_if_empty(session: AsyncSession) -> None:
             )
         )
 
+    from app.services import tasks as tasks_service  # local import: avoids a cycle
+    await tasks_service.seed_templates_if_empty(session)
+
     await session.flush()
 
 

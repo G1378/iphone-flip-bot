@@ -29,13 +29,14 @@ CHANNEL_PLAN: list[tuple[str, str, str]] = [
     ("repairs", "🔧-repairs", "`/repair` `/repair-status` `/analyse` `/order` `/orders` `/receive`"),
     ("finance", "💷-finance", "`/report` `/stock-value` `/profit` `/sales` `/expenses`"),
     ("ebay-listings", "🏷️-ebay-listings", "`/list` `/listing` `/ebay-sync` `/ebay-status`"),
+    ("tasks", "✅-tasks", "One ticket per job, each with Start / Done / Block buttons. Phone checklists appear as each phone reaches that stage. `/tasks add` `/tasks list` `/tasks phone` `/tasks summary` `/tasks setup-general` `/tasks template-list` `/tasks template-add` `/tasks template-toggle`"),
     ("admin", "⚙️-admin", "`/config business` `/config users` `/config channels` `/config locations` `/config tests` `/config part-types` `/config phone-models` `/config expense-types` `/config statuses` `/config thresholds` `/config pricing` `/config ebay` `/config sheets` `/config reset-defaults` `/demo`"),
     ("notifications", "🔔-notifications", "Automatic only: sale alerts, sync results, and error reports post here — no commands needed."),
 ]
 CHANNEL_LOOKUP = {key: (name, cheat) for key, name, cheat in CHANNEL_PLAN}
 
 # Which channels get a jump-button on the home dashboard, and in what order.
-JUMP_ORDER = ["inventory", "donors-parts", "repairs", "finance", "ebay-listings", "admin", "notifications"]
+JUMP_ORDER = ["inventory", "donors-parts", "repairs", "tasks", "finance", "ebay-listings", "admin", "notifications"]
 
 
 async def _build_home_embed(session, bot) -> discord.Embed:

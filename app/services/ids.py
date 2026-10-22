@@ -14,6 +14,7 @@ PREFIXES = {
     "listing": "LS",
     "sale": "SL",
     "expense": "EX",
+    "task": "TK",
 }
 
 
