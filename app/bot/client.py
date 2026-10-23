@@ -30,6 +30,7 @@ INITIAL_COGS = [
     "app.bot.cogs.config",
     "app.bot.cogs.search",
     "app.bot.cogs.tasks",
+    "app.bot.cogs.jobs",
     "app.bot.cogs.demo",
 ]
 

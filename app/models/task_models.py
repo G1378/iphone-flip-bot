@@ -106,3 +106,22 @@ class PhoneTicketOverride(Base):
     stage: Mapped[str] = mapped_column(String(20), nullable=False)
     created_by_discord_id: Mapped[Optional[int]] = mapped_column(BigInteger)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class JobChannel(Base):
+    """The Discord channel opened for one phone when someone presses Start.
+
+    One per phone (unique), created on Start and deleted the moment the phone
+    leaves the workshop (listed, sold, scrapped...). It holds a pinned control
+    panel whose buttons are generated from the phone's real situation."""
+
+    __tablename__ = "job_channels"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    phone_id: Mapped[int] = mapped_column(ForeignKey("phones.id", ondelete="CASCADE"), nullable=False, unique=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True, index=True)
+    panel_message_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    panel_hash: Mapped[Optional[str]] = mapped_column(String(40))
+    created_by_discord_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

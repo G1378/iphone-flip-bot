@@ -17,6 +17,7 @@ from app.db import session_scope
 from app.models.task_models import Task
 from app.services import config_service
 from app.models.inventory_models import Phone
+from app.services import jobs as jobs_service
 from app.services import phone_tickets
 from app.services import phones as phones_service
 from app.services import tasks as tasks_service
@@ -42,13 +43,16 @@ SCOPE_CHOICES = [app_commands.Choice(name="Phone tickets", value="PHONE"), app_c
 
 
 # ====================================================================== rendering
-def build_task_embed(task: Task, phone_label: Optional[tuple[str, str]] = None) -> discord.Embed:
+def build_task_embed(task: Task, phone_label: Optional[tuple[str, str]] = None, job=None) -> discord.Embed:
     e = discord.Embed(
         title=(f"{PRIORITY_EMOJI[task.priority]} " if task.priority in ("URGENT", "HIGH") else "") + task.title,
         description=(task.description or "")[:3800] or None,
         colour=STATUS_COLOUR.get(task.status, discord.Colour.blurple()),
     )
-    e.add_field(name="Status", value=f"{STATUS_EMOJI.get(task.status, '')} {STATUS_LABEL.get(task.status, task.status)}", inline=True)
+    status_text = f"{STATUS_EMOJI.get(task.status, '')} {STATUS_LABEL.get(task.status, task.status)}"
+    if job is not None and task.status == "IN_PROGRESS":
+        status_text = f"{STATUS_EMOJI['IN_PROGRESS']} In progress in <#{job.channel_id}>"
+    e.add_field(name="Status", value=status_text, inline=True)
     e.add_field(name="Priority", value=task.priority.title(), inline=True)
     e.add_field(name="Category", value=task.category or "General", inline=True)
     if phone_label:
@@ -59,12 +63,18 @@ def build_task_embed(task: Task, phone_label: Optional[tuple[str, str]] = None) 
         e.add_field(name="Due", value=f"{task.due_date.isoformat()}{' ⏰ **overdue**' if overdue else ''}", inline=True)
     if task.status == "BLOCKED" and task.blocked_reason:
         e.add_field(name="🚫 Blocked on", value=task.blocked_reason[:1000], inline=False)
+    if job is not None and task.status != "IN_PROGRESS":
+        e.add_field(name="Job channel", value=f"<#{job.channel_id}>", inline=True)
     if task.notes:
         e.add_field(name="Notes", value=task.notes[-900:], inline=False)
     if task.status == "DONE" and task.completed_at:
         by = f"<@{task.completed_by_discord_id}> " if task.completed_by_discord_id else "auto "
         e.add_field(name="Completed", value=f"{by}· <t:{int(task.completed_at.timestamp())}:R>", inline=False)
-    kind = "automatic · " + (task.stage or "").lower() if task.stage else ("recurring/template" if task.template_id else "manual ticket")
+    if task.stage:
+        kind = "automatic · " + task.stage.lower() + ("" if job is not None or task.stage not in jobs_service.JOB_STAGES
+                                                       else " · press Start to open the job channel")
+    else:
+        kind = "recurring/template" if task.template_id else "manual ticket"
     e.set_footer(text=f"{task.internal_id} · {kind}")
     return e
 
@@ -95,6 +105,13 @@ class TaskView(discord.ui.View):
 
     @discord.ui.button(label="▶️ Start", style=discord.ButtonStyle.primary, row=0, custom_id="task:start")
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with session_scope() as session:
+            task = await tasks_service.get_task_by_message(session, interaction.message.id)
+            stage, phone_pk = (task.stage, task.phone_id) if task else (None, None)
+        jobs = interaction.client.get_cog("JobsCog")
+        if jobs is not None and phone_pk and stage in jobs_service.JOB_STAGES:
+            await jobs.open_job(interaction, phone_pk)  # a channel for this phone, until it's listed
+            return
         await _mutate(interaction, lambda s, t: tasks_service.set_task_status(s, t, "IN_PROGRESS", interaction.user.id))
 
     @discord.ui.button(label="✅ Done", style=discord.ButtonStyle.success, row=0, custom_id="task:done")
@@ -146,9 +163,21 @@ class ClosedTaskView(discord.ui.View):
         await _mutate(interaction, lambda s, t: tasks_service.set_task_status(s, t, "TODO", interaction.user.id))
 
 
-def view_for(task: Task) -> discord.ui.View:
+class JobLinkView(discord.ui.View):
+    """A ticket whose phone has a job channel: Done/Block/etc. live in the channel,
+    so the ticket is just a link to it."""
+
+    def __init__(self, job):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(label="Open job channel", style=discord.ButtonStyle.link,
+                                        url=f"https://discord.com/channels/{job.guild_id}/{job.channel_id}"))
+
+
+def view_for(task: Task, job=None) -> discord.ui.View:
     if task.status in ("DONE", "CANCELLED"):
         return ClosedTaskView()
+    if job is not None and task.phone_id is not None:
+        return JobLinkView(job)
     return TaskView(task.status, phone_ticket=task.phone_id is not None, system_blocked=task.system_blocked)
 
 
@@ -186,7 +215,8 @@ async def _confirm_phone_done(interaction: discord.Interaction, ticket_id: str, 
 
 async def _render(session, task: Task) -> tuple[discord.Embed, discord.ui.View]:
     labels = await tasks_service.phone_labels(session, {task.phone_id} if task.phone_id else set())
-    return build_task_embed(task, labels.get(task.phone_id)), view_for(task)
+    job = await jobs_service.get_job(session, task.phone_id) if task.phone_id else None
+    return build_task_embed(task, labels.get(task.phone_id), job), view_for(task, job)
 
 
 async def _mutate(interaction: discord.Interaction, mutator) -> None:
@@ -428,14 +458,20 @@ class TasksCog(commands.GroupCog, group_name="tasks"):
         Also called straight after a Done press so the next ticket appears at once."""
         async with self._tick_lock:
             try:
+                jobs_cog = self.bot.get_cog("JobsCog")
+                plan = None
                 async with session_scope() as session:
                     stats = await phone_tickets.sync_phone_tickets(session)
                     recurring = await tasks_service.reconcile_recurring(session)
+                    if jobs_cog is not None:
+                        plan = await jobs_cog.plan(session, stats)
                 if stats.changed or recurring:
                     logger.info("Task engine: %d opened, %d closed, %d updated, %d recurring",
                                 stats.opened, stats.closed, stats.updated, recurring)
                 if not self._panel_checked:
                     await self._ensure_panel()
+                if jobs_cog is not None and plan is not None:
+                    await jobs_cog.apply(plan)  # redraw panels; delete channels of phones that left the workshop
                 await self._delete_closed_phone_tickets()  # old step goes first, so order reads naturally
                 await self.flush_posts()
                 await self._notify_overdue()
@@ -469,13 +505,15 @@ class TasksCog(commands.GroupCog, group_name="tasks"):
             async with session_scope() as session:
                 pending = await tasks_service.tasks_needing_post(session)
                 labels = await tasks_service.phone_labels(session, {t.phone_id for t in pending if t.phone_id})
+                jobs = {j.phone_id: j for j in await jobs_service.all_jobs(session)}
                 for task in pending:
                     # Closed before it was ever shown: nothing to post.
                     if task.discord_message_id is None and task.status in ("DONE", "CANCELLED"):
                         task.posted_version = task.version
                         continue
-                    embed = build_task_embed(task, labels.get(task.phone_id))
-                    view = view_for(task)
+                    job = jobs.get(task.phone_id) if task.phone_id else None
+                    embed = build_task_embed(task, labels.get(task.phone_id), job)
+                    view = view_for(task, job)
                     try:
                         if task.discord_message_id is None:
                             msg = await channel.send(embed=embed, view=view)

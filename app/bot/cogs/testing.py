@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import discord
 from discord import app_commands
@@ -44,8 +44,10 @@ class WalkthroughView(discord.ui.View):
     """
 
     def __init__(self, invoker_id: int, phone_internal_id: str, phone_title: str,
-                 steps: list[Step], start_status: str):
+                 steps: list[Step], start_status: str,
+                 on_finish: Optional[Callable[[], Awaitable[None]]] = None):
         super().__init__(timeout=900)
+        self.on_finish = on_finish  # e.g. a job channel redrawing its panel
         self.invoker_id = invoker_id
         self.phone_internal_id = phone_internal_id
         self.phone_title = phone_title
@@ -134,6 +136,11 @@ class WalkthroughView(discord.ui.View):
             embed = await self.summary_embed(session)
         await interaction.response.edit_message(embed=embed, view=None)
         self.stop()
+        if self.on_finish is not None:
+            try:
+                await self.on_finish()
+            except Exception:
+                logger.exception("Walkthrough on_finish hook failed")
 
     async def _answer(self, interaction: discord.Interaction, outcome: TestOutcome) -> None:
         async with self._lock:
@@ -201,6 +208,42 @@ class WalkthroughView(discord.ui.View):
             logger.debug("Could not edit timed-out testing message", exc_info=True)
 
 
+async def begin_walkthrough(interaction: discord.Interaction, internal_id: str, *,
+                            only_definition_ids: Optional[set[int]] = None,
+                            on_finish: Optional[Callable[[], Awaitable[None]]] = None) -> None:
+    """Start the PASS / FAIL walkthrough in the channel the interaction came from.
+
+    Shared by `/testing` and the job channel's buttons. `only_definition_ids`
+    limits it to specific tests (the job channel's Re-test uses the failed ones)."""
+    async with session_scope() as session:
+        phone = await phones_service.get_phone(session, internal_id)
+        if not phone:
+            await interaction.response.send_message(embed=error_embed(f"No phone found with ID `{internal_id}`."), ephemeral=True)
+            return
+        summary = await testing_service.summary(session, phone)
+        title = f"{phone.internal_id} {phone.display_name()}"
+        start_status = phone.current_status
+
+    if only_definition_ids is not None:
+        summary = [(d, r) for d, r in summary if d.id in only_definition_ids]
+    if not summary:
+        await interaction.response.send_message(embed=error_embed("No test checklist items configured. Ask an admin to run `/config tests add`."), ephemeral=True)
+        return
+
+    steps = [
+        Step(
+            test_definition_id=d.id,
+            name=d.name,
+            part_type_name=d.part_type.name if d.part_type else None,
+            previous=r.result.value if r else "NOT_TESTED",
+        )
+        for d, r in summary
+    ]
+    view = WalkthroughView(interaction.user.id, internal_id.upper(), title, steps, start_status, on_finish=on_finish)
+    await interaction.response.send_message(embed=view.step_embed(), view=view)
+    view.message = await interaction.original_response()
+
+
 class TestingCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -208,31 +251,7 @@ class TestingCog(commands.Cog):
     @app_commands.command(name="testing", description="Run through every test for a phone, one by one")
     @require_authorized()
     async def testing(self, interaction: discord.Interaction, internal_id: str):
-        async with session_scope() as session:
-            phone = await phones_service.get_phone(session, internal_id)
-            if not phone:
-                await interaction.response.send_message(embed=error_embed(f"No phone found with ID `{internal_id}`."), ephemeral=True)
-                return
-            summary = await testing_service.summary(session, phone)
-            title = f"{phone.internal_id} {phone.display_name()}"
-            start_status = phone.current_status
-
-        if not summary:
-            await interaction.response.send_message(embed=error_embed("No test checklist items configured. Ask an admin to run `/config tests add`."), ephemeral=True)
-            return
-
-        steps = [
-            Step(
-                test_definition_id=d.id,
-                name=d.name,
-                part_type_name=d.part_type.name if d.part_type else None,
-                previous=r.result.value if r else "NOT_TESTED",
-            )
-            for d, r in summary
-        ]
-        view = WalkthroughView(interaction.user.id, internal_id.upper(), title, steps, start_status)
-        await interaction.response.send_message(embed=view.step_embed(), view=view)
-        view.message = await interaction.original_response()
+        await begin_walkthrough(interaction, internal_id)
 
     @app_commands.command(name="test", description="Quickly record a single test result")
     @app_commands.choices(result=[

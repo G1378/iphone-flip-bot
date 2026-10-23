@@ -42,7 +42,7 @@ from app.models.config_models import TestDefinition
 from app.models.enums import FaultStatus, RepairPartLineStatus, TestOutcome
 from app.models.inventory_models import Part, Phone, PhoneFault, TestResult
 from app.models.repair_models import Repair, RepairPart
-from app.models.task_models import OPEN_TASK_STATUSES, PhoneTicketOverride, Task
+from app.models.task_models import OPEN_TASK_STATUSES, JobChannel, PhoneTicketOverride, Task
 from app.services import config_service
 from app.services import parts as parts_service
 from app.services import phones as phones_service
@@ -78,6 +78,7 @@ class Context:
     definitions: Sequence[TestDefinition]
     overrides: dict[int, set[str]]
     supply: dict[int, list[Unit]]  # RepairPart.id -> one Unit per quantity
+    available: dict[int, list[Part]] = field(default_factory=dict)  # part_type_id -> AVAILABLE parts (all of them)
 
 
 def _active_repair(phone: Phone) -> Optional[Repair]:
@@ -170,6 +171,22 @@ class TicketSpec:
         return hashlib.sha1(raw.encode()).hexdigest()
 
 
+@dataclass
+class Situation:
+    """Everything known about where a phone is, gathered once. Both the ticket
+    text and the job-channel buttons are generated from this, so they can't disagree."""
+    phone: Phone
+    stage: str
+    untested: list = field(default_factory=list)
+    failed: list = field(default_factory=list)
+    recorded: int = 0
+    total: int = 0
+    open_faults: list = field(default_factory=list)
+    repair: Optional[Repair] = None
+    outstanding: list = field(default_factory=list)   # RepairPart lines still to fit
+    undiagnosed: list = field(default_factory=list)  # open faults no single part fixes
+
+
 def _latest_results(phone: Phone) -> dict[int, TestResult]:
     latest: dict[int, TestResult] = {}
     for r in sorted(phone.test_results, key=lambda r: (r.tested_at, r.id)):
@@ -199,20 +216,56 @@ def _where(part: Part) -> str:
     return f"shelf {part.location.code}" if part.location else "no location set"
 
 
-def derive_ticket(phone: Phone, ctx: Context) -> Optional[TicketSpec]:
-    """The one thing this phone needs next, or None if it needs nothing right now."""
+def assess(phone: Phone, ctx: Context) -> Optional[Situation]:
+    """Which step is this phone on? None = it needs nothing right now."""
     s = phone.current_status
-    pid = phone.internal_id
     if s in TERMINAL_STATUSES:
         return None
+    untested, failed, recorded = _test_progress(phone, ctx.definitions)
+    base = dict(phone=phone, untested=untested, failed=failed, recorded=recorded, total=len(ctx.definitions))
     if s == "SHIPPED":
+        return Situation(stage="CLOSE", **base)
+    if s == "SOLD":
+        return Situation(stage="SHIP", **base)
+
+    open_faults = [f for f in phone.faults if f.status == FaultStatus.OPEN]
+    repair = _active_repair(phone)
+    base.update(open_faults=open_faults, repair=repair)
+
+    # ---- repair branch: open faults, an active repair, or flagged as needing repair
+    if open_faults or repair is not None or s in ("REPAIR_REQUIRED", "AWAITING_PARTS"):
+        outstanding = _outstanding_lines(repair)
+        undiagnosed = [f for f in open_faults if f.required_part_type_id is None]
+        base.update(outstanding=outstanding, undiagnosed=undiagnosed)
+        if outstanding or undiagnosed or repair is None:
+            return Situation(stage="REPAIR", **base)
+        return Situation(stage="VERIFY", **base)
+
+    if s in ("PURCHASED", "AWAITING_TEST") and "TEST" not in ctx.overrides.get(phone.id, set()) and untested:
+        return Situation(stage="TEST", **base)
+    if s in ("PURCHASED", "AWAITING_TEST", "TESTED"):
+        return Situation(stage="PREP", **base)
+    if s == "READY_FOR_LISTING":
+        return Situation(stage="LIST", **base)
+    return None  # LISTED with nothing wrong, or an unknown status: nothing to do
+
+
+def derive_ticket(phone: Phone, ctx: Context) -> Optional[TicketSpec]:
+    """The one thing this phone needs next, or None if it needs nothing right now."""
+    sit = assess(phone, ctx)
+    return None if sit is None else spec_for(sit, ctx)
+
+
+def spec_for(sit: Situation, ctx: Context) -> TicketSpec:
+    pid = sit.phone.internal_id
+    if sit.stage == "CLOSE":
         return TicketSpec("CLOSE", "📬 Confirm delivery and close the sale", (
             "The phone is on its way. When the buyer has it and the payout has landed:\n"
             "• Check tracking shows **delivered**\n"
             "• Match the payout to the sale (`/sales`)\n"
             "• Keep an eye on the return window\n"
             "Press **Done** when the sale is closed (marks the phone Complete)."), "LOW")
-    if s == "SOLD":
+    if sit.stage == "SHIP":
         return TicketSpec("SHIP", "📦 Final check, pack and post", (
             "It has sold. Before it leaves the building:\n"
             "• Confirm payment has cleared and the address matches\n"
@@ -220,47 +273,34 @@ def derive_ticket(phone: Phone, ctx: Context) -> Optional[TicketSpec]:
             "• Erase it, sign out of Apple ID, Find My **off**, SIM removed\n"
             "• Pack securely, tracked and insured, upload tracking to eBay\n"
             "Press **Done** once it's posted (marks the phone Shipped)."), "HIGH", due_days=1)
-
-    untested, failed, recorded = _test_progress(phone, ctx.definitions)
-    open_faults = [f for f in phone.faults if f.status == FaultStatus.OPEN]
-    repair = _active_repair(phone)
-
-    # ---- repair branch: open faults, an active repair, or flagged as needing repair
-    if open_faults or repair is not None or s in ("REPAIR_REQUIRED", "AWAITING_PARTS"):
-        outstanding = _outstanding_lines(repair)
-        undiagnosed = [f for f in open_faults if f.required_part_type_id is None]
-        if outstanding or undiagnosed or repair is None:
-            return _repair_spec(phone, ctx, repair, outstanding, undiagnosed, untested, recorded)
-        return _verify_spec(phone, repair, open_faults)
-
-    if s in ("PURCHASED", "AWAITING_TEST") and "TEST" not in ctx.overrides.get(phone.id, set()) and untested:
-        return _test_spec(phone, untested, recorded, len(ctx.definitions))
-
-    if s in ("PURCHASED", "AWAITING_TEST", "TESTED"):
+    if sit.stage == "TEST":
+        return _test_spec(sit)
+    if sit.stage == "REPAIR":
+        return _repair_spec(sit, ctx)
+    if sit.stage == "VERIFY":
+        return _verify_spec(sit)
+    if sit.stage == "PREP":
         return TicketSpec("PREP", "🧼 Prep for listing", (
             "Tests are clean. Get it ready to sell:\n"
             "• Clean and disinfect, polish the screen, clear the ports\n"
-            "• Grade it honestly (`/edit-phone`), record final battery health\n"
+            "• Grade it honestly, record final battery health\n"
             "• Erase all content, confirm no Apple ID and Find My is **off**\n"
             "• Photos: front, back, sides, screen on, battery health, IMEI, every flaw\n"
-            "• Check the price (`/analyse " + pid + "`)\n"
+            f"• Check the price (`/analyse {pid}`)\n"
             "Press **Done** when it's ready to list (marks it Ready for listing)."), "NORMAL", due_days=2)
-    if s == "READY_FOR_LISTING":
-        return TicketSpec("LIST", "🏷️ Create the eBay listing", (
-            f"Ready to sell. Run `/list {pid}` to create the listing.\n"
-            "• Title with model, storage, colour, grade and battery %\n"
-            "• Disclose any non-genuine parts or lock status\n"
-            "• Postage and returns policy set\n"
-            "This closes by itself once the listing goes live."), "NORMAL", due_days=1)
-    return None  # LISTED with nothing wrong, or an unknown status: nothing to do
+    return TicketSpec("LIST", "🏷️ Create the eBay listing", (
+        f"Ready to sell. Create the listing (`/list {pid}`).\n"
+        "• Title with model, storage, colour, grade and battery %\n"
+        "• Disclose any non-genuine parts or lock status\n"
+        "• Postage and returns policy set\n"
+        "This closes by itself once the listing goes live."), "NORMAL", due_days=1)
 
 
-def _test_spec(phone: Phone, untested, recorded: int, total: int) -> TicketSpec:
-    pid = phone.internal_id
-    lines = [f"Run the walkthrough: `/testing {pid}`", f"**Progress:** {recorded}/{total} tests recorded"]
-    if untested:
-        lines.append(f"**Still to test:** {_names(untested, 12)}")
-    if phone.current_status == "PURCHASED":
+def _test_spec(sit: Situation) -> TicketSpec:
+    lines = [f"**Progress:** {sit.recorded}/{sit.total} tests recorded"]
+    if sit.untested:
+        lines.append(f"**Still to test:** {_names(sit.untested, 12)}")
+    if sit.phone.current_status == "PURCHASED":
         lines.append(
             "**Check-in first:** photos as received, IMEI matches the advert, iCloud / Activation Lock and "
             "MDM clear, matches the listing. Raise any dispute with the seller now.")
@@ -268,16 +308,15 @@ def _test_spec(phone: Phone, untested, recorded: int, total: int) -> TicketSpec:
     return TicketSpec("TEST", "🧪 Run the tests", "\n".join(lines), "NORMAL", due_days=2)
 
 
-def _repair_spec(phone, ctx, repair, outstanding, undiagnosed, untested, recorded) -> TicketSpec:
-    pid = phone.internal_id
+def _repair_spec(sit: Situation, ctx: Context) -> TicketSpec:
     swap_now: list[str] = []
     waiting: list[str] = []
     waiting_names: list[str] = []
-    for rp in outstanding:
+    for rp in sit.outstanding:
         name = rp.required_part_type.name
         for unit in ctx.supply.get(rp.id, []):
             if unit.kind == "RESERVED":
-                swap_now.append(f"• **{name}** → `{unit.part.internal_id}` · {_where(unit.part)} (reserved)")
+                swap_now.append(f"• **{name}** → `{unit.part.internal_id}` · {_where(unit.part)} (reserved, ready to fit)")
             elif unit.kind == "IN_STOCK":
                 swap_now.append(f"• **{name}** → `{unit.part.internal_id}` · {_where(unit.part)} (in stock)")
             elif unit.kind == "ON_ORDER":
@@ -288,7 +327,7 @@ def _repair_spec(phone, ctx, repair, outstanding, undiagnosed, untested, recorde
                 waiting.append(f"• **{name}** → 📝 draft order `{unit.order.internal_id}` not placed yet")
                 waiting_names.append(f"{name} (order not placed)")
             else:
-                waiting.append(f"• **{name}** → ❌ not in stock, **needs ordering** (`/order`)")
+                waiting.append(f"• **{name}** → ❌ not in stock, **needs ordering**")
                 waiting_names.append(f"{name} (needs ordering)")
 
     parts: list[str] = []
@@ -296,18 +335,18 @@ def _repair_spec(phone, ctx, repair, outstanding, undiagnosed, untested, recorde
         parts.append("**🔧 Swap now (in stock)**\n" + "\n".join(swap_now))
     if waiting:
         parts.append("**📦 Waiting on parts**\n" + "\n".join(waiting))
-    if undiagnosed:
+    if sit.undiagnosed:
         parts.append("**🔍 Needs diagnosis** (no single part fixes these)\n"
-                     + "\n".join(f"• {f.description}" for f in undiagnosed))
-    if repair is None:
-        parts.append(f"No repair planned yet. Run `/repair {pid}` to build the plan from the open faults."
-                     if any(True for f in phone.faults if f.status == FaultStatus.OPEN)
-                     else f"It's flagged as needing repair but no fault is logged. Log one (`/fault {pid}`) "
-                          f"or, if it's actually fine, set its status (`/status {pid}`).")
+                     + "\n".join(f"• {f.description}" for f in sit.undiagnosed))
+    if sit.repair is None:
+        parts.append("No repair planned yet. Plan it from the open faults."
+                     if sit.open_faults else
+                     "It's flagged as needing repair but no fault is logged. Log the fault, or if it's actually fine, "
+                     "change its status.")
     else:
-        parts.append(f"Repair `{repair.internal_id}` · reserve/fit parts with `/reserve-part` and `/install-part`.")
-    if recorded and untested:
-        parts.append(f"⚠️ {len(untested)} test(s) still not run: {_names(untested, 8)}")
+        parts.append(f"Repair `{sit.repair.internal_id}`")
+    if sit.recorded and sit.untested:
+        parts.append(f"⚠️ {len(sit.untested)} test(s) still not run: {_names(sit.untested, 8)}")
 
     if swap_now:
         title = f"🔧 Swap parts · {len(swap_now)} now" + (f", {len(waiting)} waiting" if waiting else "")
@@ -315,25 +354,27 @@ def _repair_spec(phone, ctx, repair, outstanding, undiagnosed, untested, recorde
     elif waiting:
         title = "📦 Waiting for parts"
         waiting_reason = "Waiting for: " + ", ".join(waiting_names)
-    elif undiagnosed:
+    elif sit.undiagnosed:
         title, waiting_reason = "🔍 Diagnose the fault", None
     else:
         title, waiting_reason = "🔧 Plan the repair", None
     return TicketSpec("REPAIR", title, "\n\n".join(parts), "NORMAL", waiting_reason, due_days=3)
 
 
-def _verify_spec(phone: Phone, repair: Repair, open_faults) -> TicketSpec:
-    retest = sorted({f.description.split(" failed testing")[0] for f in open_faults if f.test_definition_id})
+def retest_definitions(sit: Situation) -> list[TestDefinition]:
+    """The tests that failed and still need re-running (their fault is open)."""
+    ids = {f.test_definition_id for f in sit.open_faults if f.test_definition_id}
+    return [d for d in sit.failed if d.id in ids] or list(sit.failed)
+
+
+def _verify_spec(sit: Situation) -> TicketSpec:
+    retest = retest_definitions(sit)
     lines = ["**Every part is fitted.** Now prove it works:"]
-    if retest:
-        lines.append("• Re-run these tests: " + ", ".join(retest) + f" (`/testing {phone.internal_id}`)")
-    else:
-        lines.append("• Re-test passed ✅")
+    lines.append("• Re-run: " + _names(retest, 10) if retest else "• Re-tests passed ✅")
     lines += [
         "• Soak test 30+ minutes (heat, restarts, battery drain)",
         "• Check Settings → General → About → Parts and Service History for warnings",
-        f"• Then `/repair-status {repair.internal_id}` and confirm, or press **Done** (completes the repair and "
-        "marks the phone Ready for listing).",
+        "• Then complete the repair, which marks the phone Ready for listing.",
     ]
     return TicketSpec("VERIFY", "✅ Re-test and close the repair", "\n".join(lines), "NORMAL", due_days=1)
 
@@ -356,10 +397,12 @@ async def load_context(session: AsyncSession, phones: Sequence[Phone]) -> Contex
     overrides: dict[int, set[str]] = {}
     for o in (await session.execute(select(PhoneTicketOverride))).scalars().all():
         overrides.setdefault(o.phone_id, set()).add(o.stage)
+    available = await _available_parts(session)
     return Context(
         definitions=await config_service.list_test_definitions(session),
         overrides=overrides,
-        supply=allocate_supply(phones, await _available_parts(session), await _orders_by_part_type(session)),
+        supply=allocate_supply(phones, available, await _orders_by_part_type(session)),
+        available=available,
     )
 
 
@@ -369,6 +412,9 @@ class SyncStats:
     closed: int = 0
     updated: int = 0
     notes: list[str] = field(default_factory=list)
+    # Handed to the job-channel panels so they are built from the same data as the tickets.
+    situations: dict[int, Situation] = field(default_factory=dict)
+    ctx: Optional[Context] = None
 
     @property
     def changed(self) -> bool:
@@ -392,13 +438,16 @@ async def _close(session: AsyncSession, task: Task, note: str, actor: Optional[i
                     actor_discord_id=actor, new_state={"stage": task.stage}, notes=note)
 
 
-async def _open(session: AsyncSession, phone: Phone, spec: TicketSpec) -> Optional[Task]:
+async def _open(session: AsyncSession, phone: Phone, spec: TicketSpec, job: Optional[JobChannel] = None) -> Optional[Task]:
+    # A phone that already has a job channel is already being worked on, so its
+    # next step's ticket opens "in progress" rather than "to do".
+    status = "BLOCKED" if spec.waiting_reason else ("IN_PROGRESS" if job else "TODO")
     try:
         async with session.begin_nested():
             task = await tasks_service.new_task(
                 session, title=spec.title, description=spec.body, category=STAGE_CATEGORY[spec.stage],
                 scope="PHONE", priority=spec.priority, phone_id=phone.id, stage=spec.stage,
-                status="BLOCKED" if spec.waiting_reason else "TODO",
+                status=status, assignee_discord_id=job.created_by_discord_id if job else None,
                 blocked_reason=spec.waiting_reason, system_blocked=bool(spec.waiting_reason),
                 due_date=(dt.date.today() + dt.timedelta(days=spec.due_days)) if spec.due_days else None,
                 content_hash=spec.content_hash(),
@@ -408,7 +457,7 @@ async def _open(session: AsyncSession, phone: Phone, spec: TicketSpec) -> Option
         return None  # another writer opened it first: the one-ticket-per-phone index held
 
 
-def _apply_spec(task: Task, spec: TicketSpec) -> bool:
+def _apply_spec(task: Task, spec: TicketSpec, job: Optional[JobChannel] = None) -> bool:
     """Bring an open ticket in line with its spec. Returns True if anything changed."""
     changed = False
     if task.content_hash != spec.content_hash():
@@ -423,7 +472,7 @@ def _apply_spec(task: Task, spec: TicketSpec) -> bool:
             task.blocked_reason = spec.waiting_reason
             changed = True
     elif task.system_blocked:  # parts arrived: release it
-        task.status, task.blocked_reason, task.system_blocked = "TODO", None, False
+        task.status, task.blocked_reason, task.system_blocked = ("IN_PROGRESS" if job else "TODO"), None, False
         changed = True
     if changed:
         tasks_service.bump(task)
@@ -441,11 +490,16 @@ async def sync_phone_tickets(session: AsyncSession, only_phone_id: Optional[int]
     if only_phone_id is not None:
         stmt = stmt.where(Task.phone_id == only_phone_id)
     open_tasks: dict[int, Task] = {t.phone_id: t for t in (await session.execute(stmt)).scalars().all()}
+    jobs: dict[int, JobChannel] = {j.phone_id: j for j in (await session.execute(select(JobChannel))).scalars().all()}
+    stats.ctx = ctx
 
     seen: set[int] = set()
     for phone in phones:
         seen.add(phone.id)
-        spec = derive_ticket(phone, ctx)
+        sit = assess(phone, ctx)
+        spec = spec_for(sit, ctx) if sit else None
+        if sit:
+            stats.situations[phone.id] = sit
         task = open_tasks.get(phone.id)
         if spec is None:
             if task:
@@ -457,9 +511,9 @@ async def sync_phone_tickets(session: AsyncSession, only_phone_id: Optional[int]
             stats.closed += 1
             task = None
         if task is None:
-            if await _open(session, phone, spec):
+            if await _open(session, phone, spec, jobs.get(phone.id)):
                 stats.opened += 1
-        elif _apply_spec(task, spec):
+        elif _apply_spec(task, spec, jobs.get(phone.id)):
             stats.updated += 1
 
     # Phones that are no longer loaded (completed, scrapped, or listed and healthy)

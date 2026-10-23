@@ -78,7 +78,7 @@ async def test_new_phone_gets_exactly_one_test_ticket(session, actor_id):
     stats = await phone_tickets.sync_phone_tickets(session)
     assert stats.opened == 1
     ticket = await _ticket(session, phone)
-    assert ticket.stage == "TEST" and ticket.scope == "PHONE" and "/testing" in ticket.description
+    assert ticket.stage == "TEST" and ticket.scope == "PHONE" and "Progress" in ticket.description
     again = await phone_tickets.sync_phone_tickets(session)
     assert not again.changed, "an unchanged phone must not touch its ticket"
 
