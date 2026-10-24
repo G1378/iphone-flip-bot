@@ -13,6 +13,7 @@ from app.db import session_scope
 from app.models.enums import RepairPartLineStatus
 from app.services import allocation as allocation_service
 from app.services import parts as parts_service
+from app.services.part_failures import proven_tag
 from app.services import repairs as repairs_service
 
 
@@ -66,7 +67,7 @@ class PartsCog(commands.Cog):
     async def find_part(self, interaction: discord.Interaction, part_type: str, model: str = ""):
         async with session_scope() as session:
             results = await parts_service.find_part_by_type_and_model(session, part_type, model)
-            items = [(p.internal_id, p.part_type.name if p.part_type else "?", p.testing_status.value,
+            items = [(p.internal_id, p.part_type.name if p.part_type else "?", proven_tag(p),
                       p.location.code if p.location else "—", p.cost) for p in results]
 
         def render(page_items, page, total_pages):
@@ -74,7 +75,8 @@ class PartsCog(commands.Cog):
             if not page_items:
                 e.description = "No matching AVAILABLE parts found."
             for internal_id, type_name, test, loc, cost in page_items:
-                e.add_field(name=f"{internal_id} — {type_name}", value=f"{test} · {loc} · £{cost}", inline=False)
+                e.add_field(name=f"{internal_id} — {type_name}",
+                            value=" · ".join(b for b in (test, loc, f"£{cost}") if b), inline=False)
             e.set_footer(text=f"Page {page + 1}/{total_pages}")
             return e
 

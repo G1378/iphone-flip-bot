@@ -14,7 +14,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot.cogs import jobs as jobs_cog
 from app.bot.cogs import tasks as tasks_cog
+from app.models.commerce_models import Expense
 from app.models.enums import TestOutcome
+from app.models.failure_models import PartFailure
 from app.models.inventory_models import Part
 from app.models.task_models import JobChannel, Task
 from app.services import config_service
@@ -256,6 +258,11 @@ def _in_channel(w, ch, user=7):
     return interaction(w.bot, user, ch, w.guild)
 
 
+async def _press(view, label_part, interaction):
+    button = next(b for b in view.children if label_part in (getattr(b, "label", "") or ""))
+    await button.callback(interaction)
+
+
 def _act_ref(buttons, act):
     return int(next(b for b in buttons if b.startswith(f"job:{act}:")).split(":")[2])
 
@@ -336,7 +343,14 @@ async def test_reserve_then_fitted_leaves_a_trail_and_keeps_the_panel_at_the_bot
     assert ch.live[-1] is panel and panel.pinned, "the panel is always the last message"
     assert any(b.startswith("job:fit:") for b in panel.buttons()) and not any(b.startswith("job:reserve:") for b in panel.buttons())
 
-    await w.jobs.handle(_in_channel(w, ch), "fit", _act_ref(panel.buttons(), "fit"))
+    inter = _in_channel(w, ch)
+    await w.jobs.handle(inter, "fit", _act_ref(panel.buttons(), "fit"))
+    popup = inter.response.sent[0]
+    assert popup.ephemeral and "Does it work?" in popup.embed.title
+    async with w.scope() as s:
+        assert (await s.execute(select(Part))).scalar_one().status == "RESERVED", "nothing is recorded until it's answered"
+    await _press(popup.view, "It works", _in_channel(w, ch))
+    assert "confirmed working" in ch.live[-2].content
     panel = ch.panel()
     assert {"job:retest:", "job:complete:"} <= {b.rsplit(":", 1)[0] + ":" for b in panel.buttons()}
     async with w.scope() as s:
@@ -466,3 +480,182 @@ async def test_a_button_in_a_channel_that_is_no_longer_a_job_is_refused(world):
     inter = interaction(w.bot, 7, stray, w.guild)
     await w.jobs.handle(inter, "reserve", 1)
     assert "isn't an active job" in inter.response.sent[0].content
+
+
+# ------------------------------------------------------------------ parts aren't pre-tested: does it work?
+async def _reserved_job(w, stock=True):
+    phone_id = await _phone_with_failed_screen(w, in_stock=stock)
+    await w.tasks.engine_tick()
+    await _press_start(w, phone_id)
+    ch = await _job_channel(w, phone_id)
+    await w.jobs.handle(_in_channel(w, ch), "reserve", _act_ref(ch.panel().buttons(), "reserve"))
+    return phone_id, ch
+
+
+async def _answer_no(w, ch, choice, reason="no touch"):
+    """Press Fitted -> 'doesn't work' -> choose what to do -> give a reason."""
+    inter = _in_channel(w, ch)
+    await w.jobs.handle(inter, "fit", _act_ref(ch.panel().buttons(), "fit"))
+    popup = inter.response.sent[0]
+    broken = _in_channel(w, ch)
+    await _press(popup.view, "doesn't work", broken)
+    menu = broken.response.edited[0]
+    assert "doesn't work" in menu.embed.title and "business loss" in menu.embed.description
+    pick = _in_channel(w, ch)
+    await _press(menu.view, choice, pick)
+    form = pick.response.modals[0]
+    form.reason._value = reason
+    submit = _in_channel(w, ch)
+    await form.on_submit(submit)
+    return submit
+
+
+async def test_fitted_asks_does_it_work_and_not_yet_changes_nothing(world):
+    w = world
+    phone_id, ch = await _reserved_job(w)
+    inter = _in_channel(w, ch)
+    await w.jobs.handle(inter, "fit", _act_ref(ch.panel().buttons(), "fit"))
+    popup = inter.response.sent[0]
+    assert [b.label for b in popup.view.children] == ["✅ It works", "❌ It doesn't work", "Not fitted yet"]
+    later = _in_channel(w, ch)
+    await _press(popup.view, "Not fitted yet", later)
+    assert "Press **Fitted** again" in later.response.edited[0].content
+    async with w.scope() as s:
+        assert (await s.execute(select(Part))).scalar_one().status == "RESERVED"
+        assert (await s.execute(select(PartFailure))).first() is None
+    assert any(b.startswith("job:fit:") for b in ch.panel().buttons()), "still waiting to be fitted"
+
+
+async def test_it_doesnt_work_scrap_writes_it_off_and_asks_for_a_replacement(world):
+    w = world
+    phone_id, ch = await _reserved_job(w)
+    submit = await _answer_no(w, ch, "Scrap it", reason="no touch")
+    assert submit.response.edited[0].content == "Recording…", "the little menu is closed so it can't be pressed twice"
+
+    trail = ch.live[-2].content
+    assert "didn't work" in trail and "scrapped" in trail and "written off" in trail
+    assert any(b.startswith("job:order:") for b in ch.panel().buttons()), "the requirement is back: a replacement is needed"
+    async with w.scope() as s:
+        part = (await s.execute(select(Part))).scalar_one()
+        failure = (await s.execute(select(PartFailure))).scalar_one()
+        expense = (await s.execute(select(Expense))).scalar_one()
+    assert part.status == "SCRAPPED" and failure.reason == "no touch" and failure.action == "SCRAP"
+    assert expense.phone_id is None and expense.category.name == "Failed parts"
+
+
+async def test_return_to_supplier_creates_a_refund_ticket_that_asks_how_much_came_back(world):
+    w = world
+    phone_id, ch = await _reserved_job(w)
+    await _answer_no(w, ch, "Return to supplier", reason="DOA")
+    assert "chase the refund" in ch.live[-2].content
+
+    await w.tasks.engine_tick()
+    returns = [m for m in w.tasks_channel.live if m.embed is not None and "Return PT-" in m.embed.title]
+    assert len(returns) == 1 and "task:done" in returns[0].buttons()
+
+    inter = interaction(w.bot, 7, w.tasks_channel, w.guild, message=SimpleNamespace(id=returns[0].id))
+    await tasks_cog.TaskView().done.callback(inter)
+    form = inter.response.modals[0]
+    assert isinstance(form, tasks_cog.RefundModal) and form.amount_in.default == "30.00"
+
+    form.amount_in._value = "25"
+    submit = interaction(w.bot, 7, w.tasks_channel, w.guild, message=SimpleNamespace(id=returns[0].id))
+    await form.on_submit(submit)
+    assert "Done" in next(f.value for f in submit.response.edited[0].embed.fields if f.name == "Status")
+    async with w.scope() as s:
+        failure = (await s.execute(select(PartFailure))).scalar_one()
+        expense = (await s.execute(select(Expense))).scalar_one()
+    assert failure.return_status == "REFUNDED" and failure.refund_amount == 25 and expense.amount == 5
+
+
+async def test_a_bad_refund_amount_is_explained_and_changes_nothing(world):
+    w = world
+    phone_id, ch = await _reserved_job(w)
+    await _answer_no(w, ch, "Return to supplier")
+    await w.tasks.engine_tick()
+    msg = next(m for m in w.tasks_channel.live if m.embed is not None and "Return PT-" in m.embed.title)
+    inter = interaction(w.bot, 7, w.tasks_channel, w.guild, message=SimpleNamespace(id=msg.id))
+    await tasks_cog.TaskView().done.callback(inter)
+    form = inter.response.modals[0]
+    form.amount_in._value = "lots"
+    submit = interaction(w.bot, 7, w.tasks_channel, w.guild, message=SimpleNamespace(id=msg.id))
+    await form.on_submit(submit)
+    assert "number" in submit.response.sent[0].embed.description
+    async with w.scope() as s:
+        assert (await s.execute(select(PartFailure))).scalar_one().return_status == "AWAITING_REFUND"
+
+
+async def test_a_second_failed_part_says_probably_not_the_part(world):
+    w = world
+    phone_id, ch = await _reserved_job(w)
+    await _answer_no(w, ch, "Scrap it")
+    async with w.scope() as s:
+        await _stock_in(s, w.actor)
+    await w.tasks.engine_tick()
+    await w.jobs.handle(_in_channel(w, ch), "reserve", _act_ref(ch.panel().buttons(), "reserve"))
+    await _answer_no(w, ch, "Keep as faulty")
+
+    assert "failed 2 times" in ch.live[-2].content and "probably not the part" in ch.live[-2].content
+    acts = {b.split(":")[1] for b in ch.panel().buttons()}
+    assert {"retry", "resolve", "retest"} <= acts and not {"order", "reserve", "fit"} & acts
+    ticket = await _ticket_message(w, phone_id)
+    assert "Diagnose" in ticket.embed.title and "Probably not the part" in ticket.embed.description
+
+
+async def _stock_in(session, actor):
+    from app.models.enums import PartSourceType
+    from app.services import parts as parts_service
+    from decimal import Decimal
+    await parts_service.create_part(session, parts_service.CreatePartInput(
+        part_type_name="Screen", source_type=PartSourceType.EXISTING_STOCK, cost=Decimal("30")), actor)
+
+
+async def test_removing_a_fitted_part_asks_why_and_a_failure_is_written_off(world):
+    w = world
+    phone_id, ch = await _reserved_job(w)
+    inter = _in_channel(w, ch)
+    await w.jobs.handle(inter, "fit", _act_ref(ch.panel().buttons(), "fit"))
+    await _press(inter.response.sent[0].view, "It works", _in_channel(w, ch))
+
+    pick = _in_channel(w, ch)
+    await w.jobs.handle(pick, "unfit", phone_id)
+    select_view = pick.response.sent[0].view
+    chosen = _in_channel(w, ch)
+    sel = select_view.children[0]
+    sel._values = [sel.options[0].value]
+    await sel.callback(chosen)
+    menu = chosen.response.edited[0]
+    assert [b.label for b in menu.view.children] == [
+        "↩️ Wrong part, back to stock", "🗑️ Scrap it", "📮 Return to supplier", "🧰 Keep as faulty"]
+
+    pressed = _in_channel(w, ch)
+    await _press(menu.view, "Scrap it", pressed)
+    form = pressed.response.modals[0]
+    form.reason._value = "died in soak test"
+    await form.on_submit(_in_channel(w, ch))
+    async with w.scope() as s:
+        failure = (await s.execute(select(PartFailure))).scalar_one()
+        part = (await s.execute(select(Part))).scalar_one()
+    assert failure.was_installed and part.status == "SCRAPPED"
+    assert any(b.startswith("job:order:") for b in ch.panel().buttons())
+
+
+async def test_supplier_quality_command_shows_who_sends_dud_parts(world, monkeypatch):
+    from app.bot.cogs import orders as orders_cog
+    from tests.test_part_failures import _received_screen
+    monkeypatch.setattr(orders_cog, "session_scope", world.scope)
+    w = world
+    await _received_screen(w.session, w.actor, supplier="ScreenCo", cost="35")   # arrives on an order
+    await w.session.commit()
+    phone_id, ch = await _reserved_job(w, stock=False)
+    await _answer_no(w, ch, "Return to supplier")
+
+    inter = interaction(w.bot, 7, w.tasks_channel, w.guild)
+    cog = orders_cog.OrdersCog(w.bot)
+    await cog.supplier_quality.callback(cog, inter, None)
+    embed = inter.response.sent[0].embed
+    assert embed.title == "📉 Supplier quality"
+    (field,) = embed.fields
+    assert field.name == "ScreenCo"
+    assert "**1** of **1** failed (100%)" in field.value
+    assert "Lost £35.00" in field.value and "1 refund(s) outstanding (£35.00)" in field.value

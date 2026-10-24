@@ -44,6 +44,7 @@ from app.models.inventory_models import Part, Phone, PhoneFault, TestResult
 from app.models.repair_models import Repair, RepairPart
 from app.models.task_models import OPEN_TASK_STATUSES, JobChannel, PhoneTicketOverride, Task
 from app.services import config_service
+from app.services import part_failures
 from app.services import parts as parts_service
 from app.services import phones as phones_service
 from app.services import repairs as repairs_service
@@ -79,6 +80,7 @@ class Context:
     overrides: dict[int, set[str]]
     supply: dict[int, list[Unit]]  # RepairPart.id -> one Unit per quantity
     available: dict[int, list[Part]] = field(default_factory=dict)  # part_type_id -> AVAILABLE parts (all of them)
+    failures: dict = field(default_factory=dict)  # (phone_id, part_type_id) -> part_failures.FailureInfo
 
 
 def _active_repair(phone: Phone) -> Optional[Repair]:
@@ -94,7 +96,7 @@ def _outstanding_lines(repair: Optional[Repair]) -> list[RepairPart]:
 
 async def _available_parts(session: AsyncSession) -> dict[int, list[Part]]:
     rows = (await session.execute(
-        select(Part).where(Part.status == "AVAILABLE").order_by(Part.testing_status.desc(), Part.created_at, Part.id)
+        select(Part).where(Part.status == "AVAILABLE").order_by(Part.created_at, Part.id)
     )).scalars().all()
     out: dict[int, list[Part]] = {}
     for p in rows:
@@ -184,7 +186,8 @@ class Situation:
     open_faults: list = field(default_factory=list)
     repair: Optional[Repair] = None
     outstanding: list = field(default_factory=list)   # RepairPart lines still to fit
-    undiagnosed: list = field(default_factory=list)  # open faults no single part fixes
+    undiagnosed: list = field(default_factory=list)  # open faults no single part fixes (incl. flagged)
+    flagged: list = field(default_factory=list)      # faults whose part keeps failing: probably not the part
 
 
 def _latest_results(phone: Phone) -> dict[int, TestResult]:
@@ -235,8 +238,13 @@ def assess(phone: Phone, ctx: Context) -> Optional[Situation]:
     # ---- repair branch: open faults, an active repair, or flagged as needing repair
     if open_faults or repair is not None or s in ("REPAIR_REQUIRED", "AWAITING_PARTS"):
         outstanding = _outstanding_lines(repair)
-        undiagnosed = [f for f in open_faults if f.required_part_type_id is None]
-        base.update(outstanding=outstanding, undiagnosed=undiagnosed)
+        outstanding_types = {rp.required_part_type_id for rp in outstanding}
+        flagged = [f for f in open_faults
+                   if f.required_part_type_id and f.required_part_type_id not in outstanding_types
+                   and (ctx.failures.get((phone.id, f.required_part_type_id)) or part_failures.FailureInfo(0, "", [])).count
+                   >= part_failures.DIAGNOSE_AFTER]
+        undiagnosed = [f for f in open_faults if f.required_part_type_id is None] + flagged
+        base.update(outstanding=outstanding, undiagnosed=undiagnosed, flagged=flagged)
         if outstanding or undiagnosed or repair is None:
             return Situation(stage="REPAIR", **base)
         return Situation(stage="VERIFY", **base)
@@ -335,9 +343,17 @@ def _repair_spec(sit: Situation, ctx: Context) -> TicketSpec:
         parts.append("**🔧 Swap now (in stock)**\n" + "\n".join(swap_now))
     if waiting:
         parts.append("**📦 Waiting on parts**\n" + "\n".join(waiting))
-    if sit.undiagnosed:
+    plain = [f for f in sit.undiagnosed if f not in sit.flagged]
+    if plain:
         parts.append("**🔍 Needs diagnosis** (no single part fixes these)\n"
-                     + "\n".join(f"• {f.description}" for f in sit.undiagnosed))
+                     + "\n".join(f"• {f.description}" for f in plain))
+    if sit.flagged:
+        lines = []
+        for f in sit.flagged:
+            info = ctx.failures[(sit.phone.id, f.required_part_type_id)]
+            lines.append(f"• **{info.part_type}** has failed {info.count} times here ({', '.join(info.part_ids)}). "
+                         f"It's probably not the part: diagnose {f.description.lower()} (board, connector, flex).")
+        parts.append("**⚠️ Probably not the part: diagnose it**\n" + "\n".join(lines))
     if sit.repair is None:
         parts.append("No repair planned yet. Plan it from the open faults."
                      if sit.open_faults else
@@ -403,6 +419,7 @@ async def load_context(session: AsyncSession, phones: Sequence[Phone]) -> Contex
         overrides=overrides,
         supply=allocate_supply(phones, available, await _orders_by_part_type(session)),
         available=available,
+        failures=await part_failures.failure_info(session),
     )
 
 
@@ -534,7 +551,7 @@ async def preview_manual_complete(session: AsyncSession, phone: Phone, stage: st
         items = await swap_now_items(session, phone)
         if not items:
             return "Nothing can be fitted yet: no reserved or in-stock parts for this repair."
-        return "Reserve and mark these as **installed**:\n" + "\n".join(
+        return "Mark these as **fitted and working** (reserving them first if needed):\n" + "\n".join(
             f"• {rp.required_part_type.name} → `{part.internal_id}`" for rp, part in items)
     if stage == "VERIFY":
         return "Complete the repair and mark the phone **Ready for listing**."
@@ -582,7 +599,8 @@ async def manual_complete(session: AsyncSession, phone: Phone, stage: str, actor
             if part.status == "AVAILABLE":
                 await parts_service.reserve_part(session, part, rp.repair, rp, actor_discord_id)
             await parts_service.install_part(session, part, phone, rp, actor_discord_id)
-        msg = f"Installed {len(items)} part(s): " + ", ".join(p.internal_id for _, p in items)
+            await part_failures.confirm_working(session, part, phone, actor_discord_id)
+        msg = f"Fitted and confirmed working: " + ", ".join(p.internal_id for _, p in items)
     elif stage == "VERIFY":
         repair = _active_repair(phone)
         if repair is None:

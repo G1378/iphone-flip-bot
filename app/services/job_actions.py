@@ -19,6 +19,7 @@ from app.models.inventory_models import Part, Phone
 from app.models.repair_models import RepairPart
 from app.services import config_service
 from app.services import orders as orders_service
+from app.services import part_failures
 from app.services import parts as parts_service
 from app.services import phone_tickets
 from app.services import phones as phones_service
@@ -94,8 +95,50 @@ async def fit(session: AsyncSession, phone_id: int, rp_id: int, actor: int) -> s
     return f"Fitted `{rp.part.internal_id}` ({rp.required_part_type.name})."
 
 
-async def unfit(session: AsyncSession, phone_id: int, part_id: int, actor: int) -> str:
-    """Wrong part fitted: take it out and put the requirement back on the list."""
+async def fit_confirmed(session: AsyncSession, phone_id: int, rp_id: int, actor: int) -> str:
+    """Fitted AND it works: the only way a fit is recorded from a job channel."""
+    phone = await _phone(session, phone_id)
+    rp = await _line(session, rp_id, phone_id)
+    await fit(session, phone_id, rp_id, actor)
+    part = await session.get(Part, rp.part_id, populate_existing=True)
+    await part_failures.confirm_working(session, part, phone, actor)
+    return f"Fitted `{part.internal_id}` ({rp.required_part_type.name}) ✅ confirmed working."
+
+
+async def fail_fit(session: AsyncSession, phone_id: int, rp_id: int, actor: int, *, action: str,
+                   reason: str = "") -> str:
+    """The reserved part didn't work when fitted: it never goes into the phone."""
+    phone = await _phone(session, phone_id)
+    rp = await _line(session, rp_id, phone_id)
+    if rp.status != RepairPartLineStatus.RESERVED or rp.part_id is None:
+        raise JobActionError(f"There's no reserved {rp.required_part_type.name} to mark as failed.")
+    part = await session.get(Part, rp.part_id, populate_existing=True)
+    try:
+        failure = await part_failures.record_failure(session, part=part, phone=phone, repair_part=rp, action=action,
+                                                     reason=reason, actor=actor, installed=False)
+    except part_failures.PartFailureError as e:
+        raise JobActionError(str(e))
+    return await _failure_message(session, part, rp.required_part_type.name, failure, phone)
+
+
+async def _failure_message(session: AsyncSession, part: Part, type_name: str, failure, phone: Phone) -> str:
+    text = f"❌ `{part.internal_id}` ({type_name}) didn't work: {part_failures.ACTION_LABEL[failure.action]}"
+    if failure.supplier:
+        text += f" · from {failure.supplier}"
+    if failure.loss_amount:
+        text += f" · £{failure.loss_amount} written off"
+    info = (await part_failures.failure_info(session)).get((phone.id, part.part_type_id))
+    if info and info.count >= part_failures.DIAGNOSE_AFTER:
+        text += f"\n⚠️ {type_name} has now failed {info.count} times on this phone. It's probably not the part: diagnose it."
+    elif failure.action == "RETURN":
+        text += "\n📮 A ticket has been opened to chase the refund."
+    return text
+
+
+async def unfit(session: AsyncSession, phone_id: int, part_id: int, actor: int, *, disposition: str = "STOCK",
+                reason: str = "") -> str:
+    """A fitted part comes out. disposition: STOCK (wrong part, back on the shelf) or
+    SCRAP / RETURN / FAULTY (it turned out not to work)."""
     phone = await _phone(session, phone_id)
     repair = await repairs_service.get_active_repair(session, phone)
     part = await session.get(Part, part_id, populate_existing=True)
@@ -103,6 +146,14 @@ async def unfit(session: AsyncSession, phone_id: int, part_id: int, actor: int) 
                  and rp.status == RepairPartLineStatus.INSTALLED), None)
     if part is None or line is None:
         raise JobActionError("That part isn't fitted on this repair.")
+    disposition = (disposition or "STOCK").upper()
+    if disposition != "STOCK":
+        try:
+            failure = await part_failures.record_failure(session, part=part, phone=phone, repair_part=line,
+                                                         action=disposition, reason=reason, actor=actor, installed=True)
+        except part_failures.PartFailureError as e:
+            raise JobActionError(str(e))
+        return await _failure_message(session, part, line.required_part_type.name, failure, phone)
     try:
         await parts_service.remove_part(session, part, line, actor, notes="Removed from job channel")
     except parts_service.PartStateError as e:
@@ -110,12 +161,54 @@ async def unfit(session: AsyncSession, phone_id: int, part_id: int, actor: int) 
     repair.parts.append(RepairPart(required_part_type_id=line.required_part_type_id, quantity=1,
                                    status=RepairPartLineStatus.REQUIRED))
     await session.flush()
-    return f"Removed `{part.internal_id}`. {line.required_part_type.name} is back on the list."
+    return f"Removed `{part.internal_id}` back to stock. {line.required_part_type.name} is back on the list."
 
 
 def fitted_parts(repair) -> list[tuple[RepairPart, Part]]:
     return [(rp, rp.part) for rp in (repair.parts if repair else [])
             if rp.status == RepairPartLineStatus.INSTALLED and rp.part is not None]
+
+
+async def open_undiagnosed(session: AsyncSession, phone_id: int):
+    """Open faults that no part is currently chasing (the ones 'Mark resolved' applies to)."""
+    phone = await _phone(session, phone_id)
+    phones = await phone_tickets.load_phones(session)
+    if phone.id not in {p.id for p in phones}:
+        phones.append(phone)
+    ctx = await phone_tickets.load_context(session, phones)
+    sit = phone_tickets.assess(phone, ctx)
+    return list(sit.undiagnosed) if sit else []
+
+
+async def resolve_fault(session: AsyncSession, phone_id: int, fault_id: int, actor: int) -> str:
+    """The person fixed it another way (e.g. a board repair)."""
+    from app.models.inventory_models import PhoneFault
+    phone = await _phone(session, phone_id)
+    fault = await session.get(PhoneFault, fault_id, populate_existing=True)
+    if fault is None or fault.phone_id != phone.id or fault.status != FaultStatus.OPEN:
+        raise JobActionError("That fault isn't open on this phone.")
+    fault.status = FaultStatus.RESOLVED
+    await session.flush()
+    await repairs_service.release_fault_from_repair(session, fault)
+    return f"Marked resolved: {fault.description}"
+
+
+async def retry_part(session: AsyncSession, phone_id: int, fault_id: int, actor: int) -> str:
+    """Another part failed, but the person wants to try one more anyway."""
+    from app.models.inventory_models import PhoneFault
+    phone = await _phone(session, phone_id)
+    fault = await session.get(PhoneFault, fault_id, populate_existing=True)
+    if fault is None or fault.phone_id != phone.id or fault.status != FaultStatus.OPEN or not fault.required_part_type_id:
+        raise JobActionError("That fault isn't waiting on a part.")
+    repair = await repairs_service.get_active_repair(session, phone)
+    if repair is None:
+        repair = await repairs_service.create_repair_for_open_faults(session, phone, actor)
+    if not any(rp.required_part_type_id == fault.required_part_type_id and rp.status in (
+            RepairPartLineStatus.REQUIRED, RepairPartLineStatus.RESERVED) for rp in repair.parts):
+        repair.parts.append(RepairPart(required_part_type_id=fault.required_part_type_id, quantity=1,
+                                       status=RepairPartLineStatus.REQUIRED))
+        await session.flush()
+    return "Added another to the list, even though the last one(s) failed."
 
 
 # ---------------------------------------------------------------- ordering

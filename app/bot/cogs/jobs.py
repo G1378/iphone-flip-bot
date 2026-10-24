@@ -29,6 +29,7 @@ from app.models.task_models import JobChannel
 from app.services import config_service
 from app.services import finance as finance_service
 from app.services import job_actions, jobs as jobs_service, phone_tickets
+from app.services import part_failures
 from app.services import parts as parts_service
 from app.services import repairs as repairs_service
 from app.services import tasks as tasks_service
@@ -188,8 +189,9 @@ class FindPartForm(_Form):
     async def on_submit(self, interaction):
         async with session_scope() as session:
             results = await parts_service.find_part_by_type_and_model(session, self.part_type.value, self.model.value)
-            rows = [f"`{p.internal_id}` {p.part_type.name if p.part_type else '?'} · {p.testing_status.value} · "
-                    f"{p.location.code if p.location else '—'} · £{p.cost}" for p in results[:15]]
+            rows = [" · ".join(b for b in (f"`{p.internal_id}` {p.part_type.name if p.part_type else '?'}",
+                                           p.location.code if p.location else "—", f"£{p.cost}", part_failures.proven_tag(p)) if b)
+                    for p in results[:15]]
         e = discord.Embed(title=f"🔎 Parts matching '{self.part_type.value} {self.model.value}'".strip(),
                           description="\n".join(rows) or "No matching available parts.", colour=discord.Colour.blue())
         await interaction.response.send_message(embed=e, ephemeral=True)
@@ -278,7 +280,113 @@ class FittedPartsView(_Picker):
 
         async def picked(interaction: discord.Interaction):
             part_id = int(select.values[0])
-            await cog.run_action(interaction, phone_id, lambda s, actor: job_actions.unfit(s, phone_id, part_id, actor))
+            await interaction.response.edit_message(
+                content="What's happening to it?", view=DispositionView(cog, invoker_id, phone_id, part_id))
+        select.callback = picked
+        self.add_item(select)
+
+
+class FailReasonForm(_Form):
+    """Asked after choosing what to do with a part that didn't work. The reason is
+    optional but is kept (it feeds the supplier quality numbers)."""
+
+    def __init__(self, cog, phone_id, title: str, runner, *, from_ephemeral: bool = True):
+        super().__init__(cog, phone_id, title[:45])
+        self.runner, self.from_ephemeral = runner, from_ephemeral
+        self.reason = self.field("What went wrong? (optional)", required=False, long=True, max_length=200,
+                                 placeholder="e.g. no touch, dead on arrival, flickers")
+
+    async def on_submit(self, interaction):
+        if self.from_ephemeral:  # close the little menu we came from so it can't be pressed twice
+            await interaction.response.edit_message(content="Recording…", embed=None, view=None)
+        await self.run(interaction, lambda s, actor: self.runner(s, actor, self.reason.value))
+
+
+FAIL_CHOICES = (("SCRAP", "🗑️ Scrap it", discord.ButtonStyle.danger),
+                ("RETURN", "📮 Return to supplier", discord.ButtonStyle.primary),
+                ("FAULTY", "🧰 Keep as faulty", discord.ButtonStyle.secondary))
+
+
+class FitCheckView(_Picker):
+    """Pressing Fitted asks: does it work? The fit is only recorded once answered."""
+
+    def __init__(self, cog: "JobsCog", invoker_id: int, phone_id: int, rp_id: int, part_label: str):
+        super().__init__(invoker_id)
+        self.cog, self.phone_id, self.rp_id, self.part_label = cog, phone_id, rp_id, part_label
+
+    @discord.ui.button(label="✅ It works", style=discord.ButtonStyle.success)
+    async def works(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Recording…", embed=None, view=None)
+        await self.cog.run_action(interaction, self.phone_id,
+                                  lambda s, actor: job_actions.fit_confirmed(s, self.phone_id, self.rp_id, actor))
+
+    @discord.ui.button(label="❌ It doesn't work", style=discord.ButtonStyle.danger)
+    async def broken(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(title=f"{self.part_label} doesn't work", colour=discord.Colour.red(),
+                              description="What should happen to it? Its cost is written off as a business loss, "
+                                          "not charged to this phone.")
+        await interaction.response.edit_message(embed=embed, view=FailChoiceView(
+            self.cog, self.invoker_id, self.phone_id, self.rp_id, self.part_label))
+
+    @discord.ui.button(label="Not fitted yet", style=discord.ButtonStyle.secondary)
+    async def not_yet(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="No problem. Press **Fitted** again once it's in.", embed=None, view=None)
+
+
+class FailChoiceView(_Picker):
+    def __init__(self, cog: "JobsCog", invoker_id: int, phone_id: int, rp_id: int, part_label: str):
+        super().__init__(invoker_id)
+        self.cog, self.phone_id, self.rp_id, self.part_label = cog, phone_id, rp_id, part_label
+        for action, label, style in FAIL_CHOICES:
+            b = discord.ui.Button(label=label, style=style)
+            b.callback = self._make(action, label)
+            self.add_item(b)
+
+    def _make(self, action: str, label: str):
+        async def callback(interaction: discord.Interaction):
+            async def runner(session, actor, reason):
+                return await job_actions.fail_fit(session, self.phone_id, self.rp_id, actor, action=action, reason=reason)
+            await interaction.response.send_modal(FailReasonForm(self.cog, self.phone_id, label.split(" ", 1)[1], runner))
+        return callback
+
+
+class DispositionView(_Picker):
+    """A fitted part is coming out: wrong part (back to stock) or it failed (scrap / return / faulty)."""
+
+    def __init__(self, cog: "JobsCog", invoker_id: int, phone_id: int, part_id: int):
+        super().__init__(invoker_id)
+        self.cog, self.phone_id, self.part_id = cog, phone_id, part_id
+        back = discord.ui.Button(label="↩️ Wrong part, back to stock", style=discord.ButtonStyle.secondary)
+        back.callback = self._stock
+        self.add_item(back)
+        for action, label, style in FAIL_CHOICES:
+            b = discord.ui.Button(label=label, style=style, row=1)
+            b.callback = self._make(action, label)
+            self.add_item(b)
+
+    async def _stock(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content="Recording…", view=None)
+        await self.cog.run_action(interaction, self.phone_id,
+                                  lambda s, actor: job_actions.unfit(s, self.phone_id, self.part_id, actor))
+
+    def _make(self, action: str, label: str):
+        async def callback(interaction: discord.Interaction):
+            async def runner(session, actor, reason):
+                return await job_actions.unfit(session, self.phone_id, self.part_id, actor, disposition=action, reason=reason)
+            await interaction.response.send_modal(FailReasonForm(self.cog, self.phone_id, label.split(" ", 1)[1], runner))
+        return callback
+
+
+class ResolveFaultView(_Picker):
+    def __init__(self, cog: "JobsCog", invoker_id: int, phone_id: int, faults):
+        super().__init__(invoker_id)
+        select = discord.ui.Select(placeholder="Which fault is fixed?", options=[
+            discord.SelectOption(label=f.description[:100], value=str(f.id)) for f in faults[:25]])
+
+        async def picked(interaction: discord.Interaction):
+            fault_id = int(select.values[0])
+            await interaction.response.edit_message(content="Recording…", view=None)
+            await cog.run_action(interaction, phone_id, lambda s, a: job_actions.resolve_fault(s, phone_id, fault_id, a))
         select.callback = picked
         self.add_item(select)
 
@@ -487,7 +595,8 @@ class JobsCog(commands.Cog):
         try:
             async with session_scope() as session:
                 message = await action(session, interaction.user.id)
-        except (JobActionError, PhoneTicketError, parts_service.PartStateError, repairs_service.RepairError) as e:
+        except (JobActionError, PhoneTicketError, part_failures.PartFailureError, parts_service.PartStateError,
+                repairs_service.RepairError) as e:
             await interaction.followup.send(embed=error_embed(str(e)), ephemeral=True)
             return
         channel = interaction.channel
@@ -510,13 +619,36 @@ class JobsCog(commands.Cog):
         # ---- one-press actions on a specific part / order
         simple = {
             "reserve": lambda s, a: job_actions.reserve(s, phone_id, ref, a),
-            "fit": lambda s, a: job_actions.fit(s, phone_id, ref, a),
+            "retry": lambda s, a: job_actions.retry_part(s, phone_id, ref, a),
             "receive": lambda s, a: job_actions.receive(s, ref, a),
             "placed": lambda s, a: job_actions.mark_placed(s, ref, a),
             "plan": lambda s, a: job_actions.plan_repair(s, phone_id, a),
         }
         if act in simple:
             await self.run_action(interaction, phone_id, simple[act])
+            return
+
+        # ---- Fitted: parts aren't tested beforehand, so ask now whether it works
+        if act == "fit":
+            async with session_scope() as session:
+                rp = await session.get(RepairPart, ref, populate_existing=True)
+                if rp is None or rp.part is None:
+                    await interaction.response.send_message("Reserve the part first.", ephemeral=True)
+                    return
+                label = f"`{rp.part.internal_id}` ({rp.required_part_type.name})"
+            embed = discord.Embed(title=f"Fitted {label}. Does it work?", colour=discord.Colour.gold(),
+                                  description="Check the phone with the part in. The fit is only recorded once you answer.")
+            await interaction.response.send_message(
+                embed=embed, view=FitCheckView(self, user, phone_id, ref, label), ephemeral=True)
+            return
+        if act == "resolve":
+            async with session_scope() as session:
+                faults = await job_actions.open_undiagnosed(session, phone_id)
+                view = ResolveFaultView(self, user, phone_id, faults) if faults else None
+            if view is None:
+                await interaction.response.send_message("There's no open fault to resolve.", ephemeral=True)
+                return
+            await interaction.response.send_message("Which fault is fixed?", ephemeral=True, view=view)
             return
 
         # ---- forms

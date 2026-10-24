@@ -101,7 +101,7 @@ async def find_compatible_available_parts(
         select(Part)
         .where(Part.part_type_id == part_type_id, Part.status == "AVAILABLE")
         .options(selectinload(Part.location), selectinload(Part.source_donor), selectinload(Part.compatible_model_links))
-        .order_by(Part.testing_status.desc(), Part.created_at.asc())
+        .order_by(Part.created_at.asc(), Part.id.asc())
     )
     parts = (await session.execute(stmt)).scalars().all()
     if phone_model_id is None:

@@ -33,6 +33,7 @@ PART_STATUSES = [
     ("RESERVED", "Reserved", False),
     ("INSTALLED", "Installed", False),
     ("FAULTY", "Faulty", False),
+    ("RETURNED", "Returned to supplier", True),
     ("SCRAPPED", "Scrapped", True),
     ("SOLD", "Sold", True),
     ("LOST", "Lost", True),

@@ -138,7 +138,12 @@ class Part(Base, TimestampMixin):
 
     condition: Mapped[Optional[str]] = mapped_column(String(100))
     grade_code: Mapped[Optional[str]] = mapped_column(String(10))
-    testing_status: Mapped[TestOutcome] = mapped_column(default=TestOutcome.NOT_TESTED)
+    testing_status: Mapped[TestOutcome] = mapped_column(default=TestOutcome.NOT_TESTED)  # legacy: parts are no longer pre-tested
+
+    # Set when someone confirms the part worked after fitting it. Parts are never
+    # tested beforehand: they're fitted and either work or they don't.
+    confirmed_working_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    confirmed_working_in: Mapped[Optional[str]] = mapped_column(String(20))  # e.g. "IP-000004"
 
     location_id: Mapped[Optional[int]] = mapped_column(ForeignKey("locations.id"))
     status: Mapped[str] = mapped_column(String(30), nullable=False, index=True)

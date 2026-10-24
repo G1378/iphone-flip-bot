@@ -75,7 +75,8 @@ def part_embed(part) -> discord.Embed:
         e.add_field(name="Donor", value=part.source_donor.internal_id, inline=True)
     e.add_field(name="Cost", value=f"£{part.cost}", inline=True)
     e.add_field(name="Grade", value=part.grade_code or "—", inline=True)
-    e.add_field(name="Test result", value=part.testing_status.value, inline=True)
+    if part.confirmed_working_at:  # parts aren't pre-tested; this is "it worked in a phone"
+        e.add_field(name="Proven", value=f"✅ worked in {part.confirmed_working_in}", inline=True)
     e.add_field(name="Location", value=part.location.code if part.location else "—", inline=True)
     if part.installed_phone_id:
         e.add_field(name="Installed in", value=str(part.installed_phone_id), inline=True)
@@ -98,9 +99,10 @@ def repair_plan_embed(phone, plan) -> discord.Embed:
             for c in item.candidates[:3]:
                 donor_bit = f" · from {c.source_donor.internal_id}" if c.source_donor else ""
                 reserved_bit = " · **RESERVED**" if c.status == "RESERVED" else ""
+                proven_bit = f" · ✅ worked in {c.confirmed_working_in}" if c.confirmed_working_at else ""
                 lines.append(
-                    f"`{c.internal_id}` £{c.cost} · {c.testing_status.value} · "
-                    f"{c.location.code if c.location else 'no location'}{donor_bit}{reserved_bit}"
+                    f"`{c.internal_id}` £{c.cost} · "
+                    f"{c.location.code if c.location else 'no location'}{proven_bit}{donor_bit}{reserved_bit}"
                 )
             e.add_field(
                 name=f"{rp.required_part_type.name} × {rp.quantity} ({len(item.candidates)} candidate(s))",

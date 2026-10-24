@@ -14,6 +14,7 @@ from app.bot.pagination import send_paginated
 from app.db import session_scope
 from app.services import config_service
 from app.services import orders as orders_service
+from app.services import part_failures
 
 
 def _parse_lines(raw: str) -> list[tuple[str, int, Decimal]]:
@@ -104,6 +105,28 @@ class OrdersCog(commands.Cog):
 
         e = discord.Embed(title=f"✅ Received — {order.internal_id}", colour=discord.Colour.green())
         e.add_field(name="Parts created", value="\n".join(f"`{p.internal_id}`" for p in created)[:1024] or "none", inline=False)
+        await interaction.response.send_message(embed=e)
+
+
+    @app_commands.command(name="supplier-quality", description="Which suppliers send dud parts? Failures, losses and refunds per supplier")
+    @app_commands.describe(days="Only look at the last N days (default: all time)")
+    @require_authorized()
+    async def supplier_quality(self, interaction: discord.Interaction, days: Optional[int] = None):
+        since = dt.date.today() - dt.timedelta(days=days) if days else None
+        async with session_scope() as session:
+            rows = list(await part_failures.supplier_quality(session, since))
+        e = discord.Embed(title="📉 Supplier quality" + (f" (last {days} days)" if days else ""), colour=discord.Colour.orange())
+        if not rows:
+            e.description = "No supplier orders yet."
+        for q in rows[:20]:
+            rate = f"{q.failure_rate:.0%}" if q.failure_rate is not None else "n/a"
+            lines = [f"**{q.failures}** of **{q.received}** failed ({rate})"]
+            if q.failures:
+                lines.append(f"Lost £{q.loss:.2f} · refunded £{q.refunded:.2f}")
+            if q.awaiting_refund:
+                lines.append(f"⏳ {q.awaiting_refund} refund(s) outstanding (£{q.awaiting_amount:.2f})")
+            e.add_field(name=q.supplier, value="\n".join(lines), inline=False)
+        e.set_footer(text="Failures are parts that were fitted (or about to be) and didn't work. Worst first.")
         await interaction.response.send_message(embed=e)
 
 

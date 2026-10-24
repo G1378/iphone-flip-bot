@@ -82,8 +82,15 @@ def actions_for(sit: Situation, ctx: Context) -> list[ActionSpec]:
         tool("skip", "⏭ Skip testing")
     elif sit.stage == "REPAIR":
         out += _line_actions(sit, ctx)
+        for f in sit.flagged:  # a part that keeps failing: allow trying again, but it's the person's call
+            info = ctx.failures[(sit.phone.id, f.required_part_type_id)]
+            out.append(ActionSpec("retry", f.id, _clip(f"🔧 Try another {info.part_type} anyway"), "secondary", "line"))
         if sit.repair is None and sit.open_faults:
             tool("plan", "🧩 Plan the repair", "primary")
+        if sit.undiagnosed:
+            if sit.failed:
+                tool("retest", "🔁 Re-test")
+            tool("resolve", "✅ Mark a fault resolved")
         tool("fault", "➕ Log a fault")
         tool("find", "🔎 Find a part")
         tool("analyse", "📊 Is it worth it?")

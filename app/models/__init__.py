@@ -33,6 +33,7 @@ from app.models.commerce_models import (  # noqa: F401
 )
 from app.models.events import InventoryEvent  # noqa: F401
 from app.models.pricing_models import PriceObservation, PriceWatchlistEntry  # noqa: F401
+from app.models.failure_models import PartFailure  # noqa: F401
 from app.models.task_models import JobChannel, PhoneTicketOverride, Task, TaskTemplate  # noqa: F401
 
 __all__ = [
@@ -71,4 +72,5 @@ __all__ = [
     "TaskTemplate",
     "PhoneTicketOverride",
     "JobChannel",
+    "PartFailure",
 ]

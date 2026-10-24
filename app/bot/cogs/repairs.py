@@ -16,6 +16,7 @@ from app.services import finance as finance_service
 from app.services import parts as parts_service
 from app.services import phones as phones_service
 from app.services import repairs as repairs_service
+from app.services.part_failures import proven_tag
 
 
 class CandidateView(discord.ui.View):
@@ -90,7 +91,8 @@ class RequirementSelect(discord.ui.Select):
             )
             return
         view = CandidateView(self.invoker_id, self.repair_internal_id, item.repair_part.id, list(item.candidates))
-        lines = "\n".join(f"`{c.internal_id}` £{c.cost} · {c.testing_status.value} · {c.location.code if c.location else '?'}" for c in item.candidates[:4])
+        lines = "\n".join(" · ".join(b for b in (f"`{c.internal_id}` £{c.cost}", c.location.code if c.location else "?",
+                                              proven_tag(c)) if b) for c in item.candidates[:4])
         await interaction.response.send_message(f"Candidates for **{item.repair_part.required_part_type.name}**:\n{lines}", view=view, ephemeral=True)
 
 

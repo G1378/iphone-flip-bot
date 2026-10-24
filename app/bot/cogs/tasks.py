@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 import discord
@@ -18,6 +19,7 @@ from app.models.task_models import Task
 from app.services import config_service
 from app.models.inventory_models import Phone
 from app.services import jobs as jobs_service
+from app.services import part_failures
 from app.services import phone_tickets
 from app.services import phones as phones_service
 from app.services import tasks as tasks_service
@@ -121,6 +123,13 @@ class TaskView(discord.ui.View):
             stage, phone_pk, ticket_id = (task.stage, task.phone_id, task.internal_id) if task else (None, None, None)
         if stage and phone_pk:
             await _confirm_phone_done(interaction, ticket_id, stage, phone_pk)
+            return
+        async with session_scope() as session:
+            task = await tasks_service.get_task_by_message(session, interaction.message.id)
+            failure = await part_failures.failure_for_task(session, task.id) if task else None
+            owed = (failure.id, failure.loss_amount) if failure and failure.return_status == "AWAITING_REFUND" else None
+        if owed:  # a supplier return: finishing it means recording the refund
+            await interaction.response.send_modal(RefundModal(interaction.message.id, owed[0], owed[1]))
             return
         await _mutate(interaction, lambda s, t: tasks_service.set_task_status(s, t, "DONE", interaction.user.id))
 
@@ -297,6 +306,33 @@ class EditModal(discord.ui.Modal, title="Edit ticket"):
                 return
             task.posted_version = task.version
             embed, view = await _render(session, task)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class RefundModal(discord.ui.Modal, title="Refund received"):
+    def __init__(self, message_id: int, failure_id: int, expected):
+        super().__init__()
+        self.message_id, self.failure_id = message_id, failure_id
+        self.amount_in = discord.ui.TextInput(label="How much came back? (£, 0 if refused)", max_length=10,
+                                              default=str(expected))
+        self.add_item(self.amount_in)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            amount = Decimal(self.amount_in.value.strip().lstrip("£"))
+        except InvalidOperation:
+            await interaction.response.send_message(embed=error_embed("Enter a number, e.g. 35.00 (or 0)."), ephemeral=True)
+            return
+        try:
+            async with session_scope() as session:
+                failure = await session.get(part_failures.PartFailure, self.failure_id)
+                await part_failures.record_refund(session, failure, amount, interaction.user.id)
+                task = await tasks_service.get_task_by_message(session, self.message_id)
+                task.posted_version = task.version
+                embed, view = await _render(session, task)
+        except part_failures.PartFailureError as e:
+            await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+            return
         await interaction.response.edit_message(embed=embed, view=view)
 
 
