@@ -9,24 +9,26 @@ from discord import app_commands
 from discord.ext import commands
 
 from app.bot.auth import require_authorized
+from app.bot.autocomplete import phone_model_autocomplete
 from app.bot.embeds import error_embed, phone_embed, success_embed
 from app.bot.pagination import send_paginated
 from app.db import session_scope
 from app.models.enums import AcquisitionType, LockStatus
+from app.services import config_service
 from app.services import phones as phones_service
 from app.services import testing as testing_service
 
 
 class BuyPhoneModal(discord.ui.Modal, title="Buy a phone"):
-    model = discord.ui.TextInput(label="Model (e.g. iPhone 13 Pro)", required=True, max_length=80)
     storage_colour = discord.ui.TextInput(label="Storage & Colour (e.g. 128GB Graphite)", required=False, max_length=60)
     imei_serial = discord.ui.TextInput(label="IMEI / Serial (optional)", required=False, max_length=60)
     price_source = discord.ui.TextInput(label="Purchase price & source (e.g. 250.00 / CEX)", required=True, max_length=100)
     notes = discord.ui.TextInput(label="Notes (optional)", required=False, style=discord.TextStyle.paragraph, max_length=500)
 
-    def __init__(self, acquisition_type: AcquisitionType):
+    def __init__(self, acquisition_type: AcquisitionType, model: str):
         super().__init__()
         self.acquisition_type = acquisition_type
+        self.model_name = model  # an exact catalog model, already checked by /buy
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
@@ -53,7 +55,7 @@ class BuyPhoneModal(discord.ui.Modal, title="Buy a phone"):
         async with session_scope() as session:
             data = phones_service.BuyPhoneInput(
                 manufacturer="Apple",
-                model=self.model.value.strip(),
+                model=self.model_name,
                 variant=None,
                 storage=storage,
                 colour=colour,
@@ -67,7 +69,11 @@ class BuyPhoneModal(discord.ui.Modal, title="Buy a phone"):
                 notes=self.notes.value or None,
                 location_code=None,
             )
-            phone = await phones_service.buy_phone(session, data, interaction.user.id)
+            try:
+                phone = await phones_service.buy_phone(session, data, interaction.user.id)
+            except config_service.UnknownPhoneModelError as e:
+                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                return
             embed = phone_embed(phone)
 
         embed.title = f"✅ Bought — {embed.title}"
@@ -79,15 +85,22 @@ class InventoryCog(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="buy", description="Record the purchase of a phone (resale or repair)")
-    @app_commands.describe(acquisition_type="Why you bought this phone")
+    @app_commands.describe(acquisition_type="Why you bought this phone",
+                           model="Exact model: base, mini, Plus, Pro and Pro Max take different parts")
     @app_commands.choices(acquisition_type=[
         app_commands.Choice(name="Resale (working, sell as-is)", value="RESALE"),
         app_commands.Choice(name="Repair (faulty, fix then sell)", value="REPAIR"),
     ])
+    @app_commands.autocomplete(model=phone_model_autocomplete)
     @require_authorized()
-    async def buy(self, interaction: discord.Interaction, acquisition_type: app_commands.Choice[str]):
-        modal = BuyPhoneModal(AcquisitionType(acquisition_type.value))
-        await interaction.response.send_modal(modal)
+    async def buy(self, interaction: discord.Interaction, acquisition_type: app_commands.Choice[str], model: str):
+        async with session_scope() as session:
+            try:
+                catalog = await config_service.resolve_phone_model(session, model)
+            except config_service.UnknownPhoneModelError as e:
+                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                return
+        await interaction.response.send_modal(BuyPhoneModal(AcquisitionType(acquisition_type.value), catalog.model))
 
     @app_commands.command(name="stock", description="List current phone inventory")
     @app_commands.describe(status="Filter by status (optional)")
@@ -122,18 +135,20 @@ class InventoryCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="edit-phone", description="Edit a phone's details")
+    @app_commands.describe(model="Correct the phone's exact model (blocked while parts are reserved or fitted)")
+    @app_commands.autocomplete(model=phone_model_autocomplete)
     @require_authorized()
     async def edit_phone(
         self, interaction: discord.Interaction, internal_id: str,
         battery_health: Optional[int] = None, cosmetic_condition: Optional[str] = None,
         functional_condition: Optional[str] = None, colour: Optional[str] = None,
-        notes: Optional[str] = None,
+        notes: Optional[str] = None, model: Optional[str] = None,
     ):
         fields = {k: v for k, v in {
             "battery_health": battery_health, "cosmetic_condition": cosmetic_condition,
             "functional_condition": functional_condition, "colour": colour, "notes": notes,
         }.items() if v is not None}
-        if not fields:
+        if not fields and not model:
             await interaction.response.send_message(embed=error_embed("Nothing to update — provide at least one field."), ephemeral=True)
             return
         async with session_scope() as session:
@@ -141,7 +156,14 @@ class InventoryCog(commands.Cog):
             if not p:
                 await interaction.response.send_message(embed=error_embed(f"No phone found with ID `{internal_id}`."), ephemeral=True)
                 return
-            await phones_service.edit_phone(session, p, interaction.user.id, **fields)
+            try:
+                if model:
+                    await phones_service.change_phone_model(session, p, model, interaction.user.id)
+                if fields:
+                    await phones_service.edit_phone(session, p, interaction.user.id, **fields)
+            except (config_service.UnknownPhoneModelError, phones_service.PhoneModelChangeError) as e:
+                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                return
             embed = phone_embed(p)
         await interaction.response.send_message(embed=success_embed(f"Updated {internal_id}"), embeds=[embed])
 
@@ -182,7 +204,12 @@ class InventoryCog(commands.Cog):
             part_type_id = None
             if required_part_type:
                 from app.services import config_service
-                pt = await config_service.get_or_create_part_type(session, required_part_type)
+                pt = await config_service.find_part_type(session, required_part_type)
+                if pt is None:
+                    valid = ", ".join(t.name for t in await config_service.list_part_types(session))
+                    await interaction.response.send_message(
+                        embed=error_embed(f"Unknown part type `{required_part_type}`. Known part types: {valid}"), ephemeral=True)
+                    return
                 part_type_id = pt.id
             await phones_service.add_fault(session, p, description, interaction.user.id, required_part_type_id=part_type_id)
             if p.current_status in ("PURCHASED", "AWAITING_TEST", "TESTED"):

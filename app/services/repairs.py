@@ -166,7 +166,10 @@ class RequirementCandidates:
 
 
 async def repair_plan(session: AsyncSession, repair: Repair, phone_model_id: Optional[int] = None) -> list[RequirementCandidates]:
-    """For each still-outstanding requirement line, find compatible AVAILABLE parts."""
+    """For each still-outstanding requirement line, find AVAILABLE parts that fit this
+    repair's phone model exactly (default: the phone's own catalog model)."""
+    if phone_model_id is None:
+        phone_model_id = repair.phone.phone_model_id
     out: list[RequirementCandidates] = []
     for rp in repair.parts:
         if rp.status in (RepairPartLineStatus.INSTALLED, RepairPartLineStatus.CANCELLED):

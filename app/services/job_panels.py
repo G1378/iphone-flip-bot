@@ -18,7 +18,9 @@ import hashlib
 from dataclasses import dataclass, field
 
 from app.models.enums import RepairPartLineStatus
-from app.services.phone_tickets import Context, Situation, spec_for
+from app.services import listing_builder
+from app.services import parts as parts_service
+from app.services.phone_tickets import Context, Situation, part_label, spec_for
 
 
 @dataclass(frozen=True)
@@ -60,8 +62,23 @@ def build_panel(sit: Situation, ctx: Context) -> PanelSpec:
         ("Battery", f"{phone.battery_health}%" if phone.battery_health else "—"),
         ("Cost", f"£{phone.purchase_price}"),
     ]
+    body = spec.body
+    if sit.stage == "LIST":
+        fields.append(("Photos", str(len(phone.photo_urls or []))))
+        draft = ctx.drafts.get(phone.id)
+        if draft is not None:
+            fields.append(("Draft", f"{draft.internal_id} · £{draft.price}"))
+            body += f"\n\n**Draft:** {draft.title}"
+            terms = ctx.offer_terms.get(phone.id)
+            if terms is not None:
+                body += f"\n**{terms.summary()}**"
+            todo = listing_builder.blockers(draft, phone)
+            if todo:
+                body += "\n**Before you can publish:**\n" + "\n".join(f"• {t}" for t in todo)
+            else:
+                body += "\n✅ Ready to publish."
     return PanelSpec(
-        stage=sit.stage, header=f"{phone.internal_id} · {phone.display_name()}", title=spec.title, body=spec.body,
+        stage=sit.stage, header=f"{phone.internal_id} · {phone.display_name()}", title=spec.title, body=body,
         fields=fields, actions=actions_for(sit, ctx),
     )
 
@@ -93,6 +110,8 @@ def actions_for(sit: Situation, ctx: Context) -> list[ActionSpec]:
             tool("resolve", "✅ Mark a fault resolved")
         tool("fault", "➕ Log a fault")
         tool("find", "🔎 Find a part")
+        if any(ctx.supply.get(rp.id) and ctx.supply[rp.id][0].kind == "TO_ORDER" for rp in sit.outstanding):
+            tool("findebay", "🌐 Find on eBay")
         tool("analyse", "📊 Is it worth it?")
         if _has_fitted(sit):
             tool("unfit", "↩️ Remove a fitted part")
@@ -103,8 +122,20 @@ def actions_for(sit: Situation, ctx: Context) -> list[ActionSpec]:
         tool("edit", "✏️ Edit details")
         if _has_fitted(sit):
             tool("unfit", "↩️ Remove a fitted part")
-    elif sit.stage in ("PREP", "LIST"):
-        tool("done", "✅ Done" if sit.stage == "PREP" else "✅ Mark as listed", "success")
+    elif sit.stage == "LIST":
+        draft = ctx.drafts.get(pid)
+        if draft is None:
+            tool("buildlisting", "📝 Build eBay listing", "primary")
+        else:
+            ready = not listing_builder.blockers(draft, sit.phone)
+            out.append(ActionSpec("publishlisting", draft.id, _clip(f"🚀 Publish to eBay · £{draft.price}"),
+                                  "success" if ready else "secondary", "tool"))
+            out.append(ActionSpec("editlisting", draft.id, "✏️ Edit listing", "secondary", "tool"))
+            tool("buildlisting", "🔄 Rebuild")
+        tool("done", "✅ Mark as listed (done elsewhere)")
+        tool("fault", "➕ Log a fault")
+    elif sit.stage == "PREP":
+        tool("done", "✅ Done", "success")
         tool("fault", "➕ Log a fault")
     tool("details", "📱 Details")
     return out
@@ -121,7 +152,7 @@ def _line_actions(sit: Situation, ctx: Context) -> list[ActionSpec]:
     fit, reserve, receive, place, order, alt = [], [], [], [], [], []
     seen_orders: set[int] = set()
     for rp in sit.outstanding:
-        name = rp.required_part_type.name
+        name = part_label(rp, sit.phone)
         units = ctx.supply.get(rp.id, [])
         if not units:
             continue
@@ -130,7 +161,8 @@ def _line_actions(sit: Situation, ctx: Context) -> list[ActionSpec]:
             fit.append(ActionSpec("fit", rp.id, _clip(f"🔧 Fitted: {name} ({unit.part.internal_id})"), "success", "line"))
         elif unit.kind == "IN_STOCK":
             reserve.append(ActionSpec("reserve", rp.id, _clip(f"📥 Reserve {name} ({unit.part.internal_id})"), "primary", "line"))
-            if len(ctx.available.get(rp.required_part_type_id, [])) > 1:
+            if len(parts_service.fitting_parts(ctx.available.get(rp.required_part_type_id, []),
+                                               sit.phone.phone_model_id)) > 1:
                 alt.append(ActionSpec("alt", rp.id, _clip(f"🔍 Other {name} options"), "secondary", "line"))
         elif unit.kind == "ON_ORDER":
             if unit.order.id not in seen_orders:

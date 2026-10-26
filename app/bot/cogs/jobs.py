@@ -180,19 +180,45 @@ class OrderForm(_Form):
             shipping=self.shipping.value, expected=self.expected.value))
 
 
+class ListingEditForm(_Form):
+    """Tweak the auto-built eBay draft. The bot wrote it; this is where a person puts right
+    anything it got wrong before pressing Publish."""
+
+    def __init__(self, cog, phone_id, listing):
+        super().__init__(cog, phone_id, "Edit eBay listing")
+        self.listing_id = listing.id
+        self.listing_title = self.field("Title (80 max)", max_length=80, default=listing.title)
+        self.price = self.field("Price (£)", max_length=10, default=str(listing.price))
+        self.condition = self.field("Condition", max_length=60, default=listing.condition_text or "")
+        self.description = self.field("Description", long=True, max_length=4000, default=listing.description)
+
+    async def on_submit(self, interaction):
+        await self.run(interaction, lambda s, actor: job_actions.edit_listing(
+            s, self.phone_id, self.listing_id, actor, title=self.listing_title.value, price=self.price.value,
+            condition_text=self.condition.value, description=self.description.value))
+
+
 class FindPartForm(_Form):
     def __init__(self, cog, phone_id):
         super().__init__(cog, phone_id, "Find a part")
         self.part_type = self.field("Part (e.g. screen)", max_length=60)
-        self.model = self.field("Phone model (optional)", required=False, max_length=60, placeholder="13 pro")
+        self.model = self.field("Phone model (blank = this phone's model)", required=False, max_length=60, placeholder="13 pro")
 
     async def on_submit(self, interaction):
         async with session_scope() as session:
-            results = await parts_service.find_part_by_type_and_model(session, self.part_type.value, self.model.value)
-            rows = [" · ".join(b for b in (f"`{p.internal_id}` {p.part_type.name if p.part_type else '?'}",
+            try:
+                model_text = self.model.value.strip()
+                if not model_text:  # default to the phone this channel is for
+                    phone = await session.get(Phone, self.phone_id)
+                    model_text = (await config_service.phone_model_for(session, phone)).model
+                results = await parts_service.find_part_by_type_and_model(session, self.part_type.value, model_text)
+            except config_service.UnknownPhoneModelError as err:
+                await interaction.response.send_message(embed=error_embed(str(err)), ephemeral=True)
+                return
+            rows = [" · ".join(b for b in (f"`{p.internal_id}` {p.part_type.name if p.part_type else '?'} ({p.model_label()})",
                                            p.location.code if p.location else "—", f"£{p.cost}", part_failures.proven_tag(p)) if b)
                     for p in results[:15]]
-        e = discord.Embed(title=f"🔎 Parts matching '{self.part_type.value} {self.model.value}'".strip(),
+        e = discord.Embed(title=f"🔎 {self.part_type.value} for {model_text}".strip(),
                           description="\n".join(rows) or "No matching available parts.", colour=discord.Colour.blue())
         await interaction.response.send_message(embed=e, ephemeral=True)
 
@@ -275,7 +301,7 @@ class FittedPartsView(_Picker):
     def __init__(self, cog: "JobsCog", invoker_id: int, phone_id: int, fitted):
         super().__init__(invoker_id)
         select = discord.ui.Select(placeholder="Which part came out?", options=[
-            discord.SelectOption(label=f"{part.internal_id} · {rp.required_part_type.name}"[:100], value=str(part.id))
+            discord.SelectOption(label=f"{part.internal_id} · {rp.required_part_type.name} ({part.model_label()})"[:100], value=str(part.id))
             for rp, part in fitted[:25]])
 
         async def picked(interaction: discord.Interaction):
@@ -616,6 +642,30 @@ class JobsCog(commands.Cog):
             return
         user = interaction.user.id
 
+        if act == "findebay":
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            async with session_scope() as session:
+                try:
+                    text = await job_actions.find_ebay_parts(session, phone_id, self.bot.ebay_client)
+                except JobActionError as e:
+                    await interaction.followup.send(embed=error_embed(str(e)), ephemeral=True)
+                    return
+            await interaction.followup.send(text[:1900], ephemeral=True)
+            return
+
+        # ---- eBay listing: the bot builds it, you press the button
+        if act == "buildlisting":
+            await self.run_action(interaction, phone_id, lambda s, a: job_actions.build_listing(s, phone_id, a))
+            return
+        if act == "editlisting":
+            async with session_scope() as session:
+                draft = await job_actions._draft(session, phone_id, ref)
+            await interaction.response.send_modal(ListingEditForm(self, phone_id, draft))
+            return
+        if act == "publishlisting":
+            await self._confirm_publish(interaction, phone_id, ref)
+            return
+
         # ---- one-press actions on a specific part / order
         simple = {
             "reserve": lambda s, a: job_actions.reserve(s, phone_id, ref, a),
@@ -635,7 +685,7 @@ class JobsCog(commands.Cog):
                 if rp is None or rp.part is None:
                     await interaction.response.send_message("Reserve the part first.", ephemeral=True)
                     return
-                label = f"`{rp.part.internal_id}` ({rp.required_part_type.name})"
+                label = f"`{rp.part.internal_id}` ({rp.required_part_type.name} · {rp.part.model_label()})"
             embed = discord.Embed(title=f"Fitted {label}. Does it work?", colour=discord.Colour.gold(),
                                   description="Check the phone with the part in. The fit is only recorded once you answer.")
             await interaction.response.send_message(
@@ -655,7 +705,7 @@ class JobsCog(commands.Cog):
         if act == "order":
             async with session_scope() as session:
                 rp = await session.get(RepairPart, ref)
-                name = rp.required_part_type.name if rp else "part"
+                name = (f"{rp.required_part_type.name} ({rp.repair.phone.model})" if rp else "part")
             await interaction.response.send_modal(OrderForm(self, phone_id, ref, name))
             return
         forms = {"fault": FaultForm, "edit": DetailsForm, "move": MoveForm, "find": FindPartForm}
@@ -732,6 +782,38 @@ class JobsCog(commands.Cog):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
         await interaction.response.send_message("That button isn't available any more.", ephemeral=True)
+
+    async def _confirm_publish(self, interaction: discord.Interaction, phone_id: int, listing_id: int) -> None:
+        """Show exactly what's about to go live (or what's stopping it), then wait for a second tap."""
+        from app.services import listing_builder
+        async with session_scope() as session:
+            try:
+                draft = await job_actions._draft(session, phone_id, listing_id)
+            except JobActionError as e:
+                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                return
+            phone = draft.phone
+            todo = listing_builder.blockers(draft, phone)
+            gaps = await listing_builder.setup_gaps(session) if self.bot.ebay_client.configured else []
+            if gaps:
+                todo.append("eBay setup isn't finished (" + ", ".join(gaps) + "): an admin needs to run `/config ebay-setup`")
+            offer = await listing_builder.best_offer_terms(session, draft, phone)
+            summary = (f"**{draft.title}**\n£{draft.price} · {draft.condition_text or '—'} · "
+                       f"{len(phone.photo_urls or [])} photo(s)\n{offer.summary()}")
+        if todo:
+            await interaction.response.send_message(
+                embed=error_embed("Can't publish yet:\n" + "\n".join(f"• {t}" for t in todo)), ephemeral=True)
+            return
+
+        async def on_confirm(inner: discord.Interaction) -> None:
+            await inner.response.edit_message(content="Publishing…", embed=None, view=None)
+            await self.run_action(inner, phone_id, lambda s, a: job_actions.publish_listing(
+                s, phone_id, listing_id, a, self.bot.ebay_client))
+
+        embed = discord.Embed(title="Publish this to eBay?", description=summary, colour=discord.Colour.gold())
+        embed.set_footer(text="This puts it live on eBay.")
+        await interaction.response.send_message(
+            embed=embed, view=ConfirmView(interaction.user.id, on_confirm, confirm_label="🚀 Publish"), ephemeral=True)
 
     async def _confirm_finish(self, interaction: discord.Interaction, phone_id: int, act: str) -> None:
         async with session_scope() as session:

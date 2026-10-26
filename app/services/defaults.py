@@ -124,6 +124,20 @@ DEFAULT_PART_TYPES = [
     "Logic Board", "Face ID Module", "Home Button",
 ]
 
+# Every model is its own catalog entry: base, mini, Plus, Pro and Pro Max have
+# different batteries, screens, cameras and housings, so a part is always tagged
+# to exact models. Admins can add newer models with `/config phone-models`.
+DEFAULT_PHONE_MODELS = [
+    "iPhone X", "iPhone XR", "iPhone XS", "iPhone XS Max",
+    "iPhone 11", "iPhone 11 Pro", "iPhone 11 Pro Max",
+    "iPhone SE (2nd generation)", "iPhone SE (3rd generation)",
+    "iPhone 12 mini", "iPhone 12", "iPhone 12 Pro", "iPhone 12 Pro Max",
+    "iPhone 13 mini", "iPhone 13", "iPhone 13 Pro", "iPhone 13 Pro Max",
+    "iPhone 14", "iPhone 14 Plus", "iPhone 14 Pro", "iPhone 14 Pro Max",
+    "iPhone 15", "iPhone 15 Plus", "iPhone 15 Pro", "iPhone 15 Pro Max",
+    "iPhone 16", "iPhone 16 Plus", "iPhone 16 Pro", "iPhone 16 Pro Max",
+]
+
 DEFAULT_CONDITION_GRADES = [
     ("A", "Excellent - like new", 1),
     ("A-", "Very good - minor wear", 2),
@@ -142,13 +156,23 @@ DEFAULT_BUSINESS_SETTINGS = [
     ("business_name", "My Phone Business", "string", "Shown on listings/reports"),
     ("currency", "GBP", "string", "ISO currency code"),
     ("currency_symbol", "£", "string", "Symbol used in Discord output"),
-    ("default_postage_cost", "6.00", "number", "Default outbound shipping cost"),
+    ("default_postage_cost", "2.98", "number", "Default outbound shipping cost"),
     ("default_packaging_cost", "1.00", "number", "Default packaging cost per sale"),
     ("ebay_fee_pct_assumption", "12.8", "number", "Estimated eBay final value fee %, used before actual fee is known"),
     ("ebay_fixed_fee_assumption", "0.30", "number", "Estimated fixed per-order eBay fee"),
     ("min_profit_gbp", "20.00", "number", "Global minimum acceptable net profit"),
     ("min_roi_pct", "15.00", "number", "Global minimum acceptable ROI %"),
     ("target_margin_pct", "25.00", "number", "Global target margin %"),
+    ("listing_whats_included", "", "string", "Shown in every eBay listing under 'What's included' (e.g. 'Phone only, no charger'). Blank = section left out"),
+    ("listing_extra_text", "", "string", "Extra paragraph added to every eBay listing (e.g. your warranty). Blank = left out"),
+    ("default_shipping_in_cost", "3.50", "number", "Postage assumed on eBay buys when the listing doesn't show it"),
+    ("deal_auction_alert_hours", "6", "number", "Auctions only appear in deal alerts when they end within this many hours"),
+    ("best_offer_enabled", "true", "string", "Allow buyers to make offers on eBay listings (true/false)"),
+    ("best_offer_auto_accept_pct", "", "number", "Auto-accept offers at or above this % of the asking price (e.g. 95). Blank = never auto-accept"),
+    ("ebay_fulfillment_policy_id", "", "string", "eBay postage policy used for listings (set by /config ebay-setup)"),
+    ("ebay_payment_policy_id", "", "string", "eBay payment policy used for listings (set by /config ebay-setup)"),
+    ("ebay_return_policy_id", "", "string", "eBay returns policy used for listings (set by /config ebay-setup)"),
+    ("ebay_merchant_location_key", "", "string", "eBay stock location listings are published from (set by /config ebay-setup)"),
     ("default_repair_cost_assumption", "60.00", "number",
      "Fallback repair cost estimate used for faulty-phone buy price recommendations when a model has no repair history yet"),
 ]

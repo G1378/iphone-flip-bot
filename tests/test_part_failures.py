@@ -21,6 +21,7 @@ from app.services import parts as parts_service
 from app.services.job_actions import JobActionError
 from app.services import phone_tickets, config_service
 from tests.test_job_panels import _acts, _line, _panel
+from tests.conftest import model_id
 from tests.test_tasks import _buy, _order, _record, _stock, _ticket
 
 
@@ -28,7 +29,8 @@ async def _received_screen(session, actor_id, supplier="ScreenCo", cost="35"):
     """A screen that arrived on an order (so it knows its supplier)."""
     pt = await config_service.get_or_create_part_type(session, "Screen")
     order = await orders_service.create_order(
-        session, supplier, [orders_service.OrderLineInput(part_type_id=pt.id, quantity=1, unit_cost=Decimal(cost))], actor_id)
+        session, supplier, [orders_service.OrderLineInput(part_type_id=pt.id, quantity=1, unit_cost=Decimal(cost),
+                                       phone_model_id=await model_id(session, "iPhone 13"))], actor_id)
     await orders_service.mark_ordered(session, order, actor_id)
     await orders_service.receive_order(session, await orders_service.get_order(session, order.internal_id), actor_id)
     return (await session.execute(select(Part).order_by(Part.id.desc()))).scalars().first()
@@ -65,7 +67,7 @@ async def test_parts_have_no_pre_test_ordering_any_more(session, actor_id):
     second = await _stock(session, actor_id, "Screen")
     second.testing_status = TestOutcome.PASS      # the old label must not affect what's offered
     await session.flush()
-    found = await parts_service.find_part_by_type_and_model(session, "screen", "")
+    found = await parts_service.find_part_by_type_and_model(session, "screen", "iPhone 13")
     assert [p.internal_id for p in found][:2] == [first.internal_id, second.internal_id]
 
 
@@ -278,7 +280,8 @@ async def test_supplier_quality_counts_failures_per_supplier(session, actor_id):
     # ScreenCo sends 3 screens and one of them is dud. CheapParts sends 1 and it's fine.
     pt = await config_service.get_or_create_part_type(session, "Screen")
     order = await orders_service.create_order(
-        session, "ScreenCo", [orders_service.OrderLineInput(part_type_id=pt.id, quantity=3, unit_cost=Decimal("30"))], actor_id)
+        session, "ScreenCo", [orders_service.OrderLineInput(part_type_id=pt.id, quantity=3, unit_cost=Decimal("30"),
+                                                      phone_model_id=await model_id(session, "iPhone 13"))], actor_id)
     await orders_service.mark_ordered(session, order, actor_id)
     await orders_service.receive_order(session, await orders_service.get_order(session, order.internal_id), actor_id)
     await _received_screen(session, actor_id, supplier="CheapParts", cost="20")

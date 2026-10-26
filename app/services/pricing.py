@@ -32,9 +32,23 @@ FAULTY_CONDITION_IDS = ["7000"]
 MIN_SOLD_SAMPLES = 3  # below this, fall back to active-listing estimate even if sold data exists
 
 
+SIBLING_WORDS = _SIBLING_WORDS = ("pro", "max", "plus", "mini")
+
+
 def build_search_query(phone_model: PhoneModelConfig, storage: Optional[str]) -> str:
+    """eBay keyword query for ONE exact model. Siblings of the same generation share
+    most of their name ("iPhone 13" is a substring of "iPhone 13 Pro Max") and sell
+    for very different prices, so words that belong to a sibling but not to this model
+    are excluded with eBay's minus syntax."""
     bits = [phone_model.manufacturer, phone_model.model, phone_model.variant, storage]
-    return " ".join(b for b in bits if b)
+    return " ".join([b for b in bits if b] + sibling_exclusions(phone_model))
+
+
+def sibling_exclusions(phone_model: PhoneModelConfig) -> list[str]:
+    """['-pro', '-max', ...]: eBay minus-terms for the words that belong to this model's siblings."""
+    words = {w.lower() for b in (phone_model.manufacturer, phone_model.model, phone_model.variant) if b
+             for w in b.replace("(", " ").replace(")", " ").split()}
+    return [f"-{w}" for w in _SIBLING_WORDS if w not in words]
 
 
 # ----------------------------------------------------------------------
@@ -199,9 +213,7 @@ async def average_repair_cost_for_model(session: AsyncSession, phone_model_id: i
         .join(Phone, Repair.phone_id == Phone.id)
         .where(
             Repair.status == "COMPLETE",
-            Phone.manufacturer == phone_model.manufacturer,
-            Phone.model == phone_model.model,
-            Phone.variant == phone_model.variant,
+            Phone.phone_model_id == phone_model.id,
         )
         .options(selectinload(Repair.parts))
     )
@@ -230,7 +242,7 @@ async def compute_recommendation(session: AsyncSession, entry: PriceWatchlistEnt
 
     fee_pct = await config_service.get_setting_decimal(session, "ebay_fee_pct_assumption", Decimal("12.8"))
     fee_fixed = await config_service.get_setting_decimal(session, "ebay_fixed_fee_assumption", Decimal("0.30"))
-    postage = await config_service.get_setting_decimal(session, "default_postage_cost", Decimal("6.00"))
+    postage = await config_service.get_setting_decimal(session, "default_postage_cost", Decimal("2.98"))
     packaging = await config_service.get_setting_decimal(session, "default_packaging_cost", Decimal("1.00"))
     min_profit = await config_service.get_setting_decimal(session, "min_profit_gbp", Decimal("20.00"))
 
@@ -267,13 +279,9 @@ async def get_current_estimated_sale_price(session: AsyncSession, phone: Phone) 
     checking storage-specific pricing data first before falling back to
     the model's general default_sale_price. Used by /analyse and /list so
     they benefit from live watchlist pricing automatically."""
-    stmt = select(PhoneModelConfig).where(
-        PhoneModelConfig.manufacturer == phone.manufacturer,
-        PhoneModelConfig.model == phone.model,
-        PhoneModelConfig.variant == phone.variant,
-    )
-    phone_model = (await session.execute(stmt)).scalar_one_or_none()
-    if not phone_model:
+    try:
+        phone_model = await config_service.phone_model_for(session, phone)
+    except config_service.UnknownPhoneModelError:
         return None
 
     obs = await latest_observation(session, phone_model.id, phone.storage, PriceConditionBucket.USED)

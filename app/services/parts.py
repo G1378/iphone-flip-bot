@@ -11,7 +11,6 @@ from sqlalchemy.orm import selectinload
 
 from app.models.enums import InventoryEventType, PartSourceType, TestOutcome
 from app.models.inventory_models import Part, PartCompatibleModel, Phone
-from app.models.config_models import PhoneModelConfig
 from app.models.repair_models import Repair, RepairPart, RepairPartLineStatus
 from app.services import config_service
 from app.services.events import log_event
@@ -20,6 +19,26 @@ from app.services.ids import next_internal_id
 
 class PartStateError(ValueError):
     pass
+
+
+class PartFitError(PartStateError):
+    """The part is for a different phone model than the one it's being used on."""
+
+
+def fitting_parts(parts: Sequence[Part], phone_model_id: Optional[int]) -> list[Part]:
+    """Only the parts tagged for exactly this model, in the order given.
+    Untagged parts and phones with no model match nothing (no 'universal' parts)."""
+    return [p for p in parts if p.fits_model(phone_model_id)]
+
+
+async def assert_part_fits(session: AsyncSession, part: Part, phone) -> None:
+    """Hard block: raise PartFitError unless `part` is tagged for this phone's exact model."""
+    model = await config_service.phone_model_for(session, phone)
+    if not part.fits_model(model.id):
+        raise PartFitError(
+            f"{part.internal_id} is a {part.part_type.name} for **{part.model_label()}**, "
+            f"but {phone.internal_id} is an **{model.model}**. Different models take different parts."
+        )
 
 
 @dataclass
@@ -32,11 +51,16 @@ class CreatePartInput:
     testing_status: TestOutcome = TestOutcome.NOT_TESTED
     location_code: Optional[str] = None
     notes: Optional[str] = None
-    compatible_model_ids: Optional[list[int]] = None
+    compatible_model_ids: Optional[list[int]] = None  # REQUIRED: every part is for specific models
     source_order_line_id: Optional[int] = None
 
 
 async def create_part(session: AsyncSession, data: CreatePartInput, actor_discord_id: int) -> Part:
+    model_ids = list(dict.fromkeys(data.compatible_model_ids or []))
+    if not model_ids:
+        raise PartStateError(
+            f"A {data.part_type_name} must be created for a specific phone model "
+            "(e.g. 'Battery for iPhone 13 Pro'), not just 'Battery'.")
     part_type = await config_service.get_or_create_part_type(session, data.part_type_name)
     location = None
     if data.location_code:
@@ -60,9 +84,10 @@ async def create_part(session: AsyncSession, data: CreatePartInput, actor_discor
     session.add(part)
     await session.flush()
 
-    for model_id in data.compatible_model_ids or []:
+    for model_id in model_ids:
         session.add(PartCompatibleModel(part_id=part.id, phone_model_id=model_id))
     await session.flush()
+    await session.refresh(part, ["compatible_model_links"])
 
     await log_event(
         session,
@@ -85,18 +110,11 @@ async def get_part(session: AsyncSession, internal_id: str) -> Optional[Part]:
 
 
 async def find_compatible_available_parts(
-    session: AsyncSession, part_type_id: int, phone_model_id: Optional[int] = None,
+    session: AsyncSession, part_type_id: int, phone_model_id: Optional[int],
 ) -> Sequence[Part]:
-    """Parts matching a required type that are AVAILABLE (not reserved/installed).
-
-    If phone_model_id is given, prefers parts explicitly marked compatible
-    with that model, but MVP falls back to *all* AVAILABLE parts of that
-    type if no explicit compatibility rows exist (many small operations
-    won't bother tagging compatibility for every part) - callers should
-    treat the phone_model filter as a ranking hint, not a hard filter,
-    which is why this returns all AVAILABLE parts of the type ordered with
-    compatible ones first.
-    """
+    """AVAILABLE parts of a type that fit exactly this phone model. A part for a
+    different model (or one with no model set) is never returned: it can't be
+    reserved or fitted, so it must not be offered."""
     stmt = (
         select(Part)
         .where(Part.part_type_id == part_type_id, Part.status == "AVAILABLE")
@@ -104,23 +122,38 @@ async def find_compatible_available_parts(
         .order_by(Part.created_at.asc(), Part.id.asc())
     )
     parts = (await session.execute(stmt)).scalars().all()
-    if phone_model_id is None:
-        return parts
+    return fitting_parts(parts, phone_model_id)
 
-    def is_compatible(p: Part) -> bool:
-        if not p.compatible_model_links:
-            return True  # untagged = assumed universally compatible for this part type (MVP)
-        return any(link.phone_model_id == phone_model_id for link in p.compatible_model_links)
 
-    compatible = [p for p in parts if is_compatible(p)]
-    incompatible = [p for p in parts if not is_compatible(p)]
-    return compatible + incompatible
+async def set_part_models(session: AsyncSession, part: Part, model_ids: Sequence[int], actor_discord_id: int) -> Part:
+    """Correct which models a part is tagged for (e.g. it was ordered/entered for the wrong one).
+    Not allowed while the part is reserved or fitted: that would silently break a live repair."""
+    ids = list(dict.fromkeys(model_ids))
+    if not ids:
+        raise PartStateError("A part must be tagged with at least one phone model.")
+    if part.status in ("RESERVED", "INSTALLED"):
+        raise PartStateError(f"{part.internal_id} is {part.status}; release or remove it before changing its model.")
+    before = part.model_label()
+    for link in list(part.compatible_model_links):
+        part.compatible_model_links.remove(link)
+    await session.flush()
+    for mid in ids:
+        part.compatible_model_links.append(PartCompatibleModel(part_id=part.id, phone_model_id=mid))
+    await session.flush()
+    await session.refresh(part, ["compatible_model_links"])
+    await log_event(
+        session, event_type=InventoryEventType.MANUAL_ADJUSTMENT.value, entity_type="PART",
+        entity_id=part.internal_id, actor_discord_id=actor_discord_id,
+        previous_state={"models": before}, new_state={"models": part.model_label()},
+    )
+    return part
 
 
 async def reserve_part(session: AsyncSession, part: Part, repair: Repair, repair_part: RepairPart,
                         actor_discord_id: int) -> Part:
     if part.status != "AVAILABLE":
         raise PartStateError(f"{part.internal_id} is not AVAILABLE (currently {part.status}).")
+    await assert_part_fits(session, part, repair.phone)
     part.status = "RESERVED"
     part.reserved_for_repair_id = repair.id
     repair_part.part_id = part.id
@@ -168,6 +201,7 @@ async def install_part(session: AsyncSession, part: Part, phone: Phone, repair_p
                         actor_discord_id: int) -> Part:
     if part.status not in ("RESERVED", "AVAILABLE"):
         raise PartStateError(f"{part.internal_id} cannot be installed from status {part.status}.")
+    await assert_part_fits(session, part, phone)
     part.status = "INSTALLED"
     part.installed_phone_id = phone.id
     part.reserved_for_repair_id = None
@@ -272,12 +306,14 @@ async def search_parts(session: AsyncSession, term: str) -> Sequence[Part]:
 
 
 async def find_part_by_type_and_model(session: AsyncSession, part_type_term: str, model_term: str) -> Sequence[Part]:
-    """Powers `/find-part screen 13 pro` - fuzzy match on part type name and,
-    if the part has tagged compatibility, on phone model text. Parts with no
-    compatibility tags are treated as matching any model (MVP default)."""
+    """Powers `/find-part screen 13 pro`: AVAILABLE parts whose type name matches
+    and that are tagged for exactly that model. The model is required and must be
+    a catalog model ('13' never returns '13 Pro' parts)."""
     from app.models.config_models import PartTypeConfig
 
-    like_type = f"%{part_type_term}%"
+    if not (model_term or "").strip():
+        raise config_service.UnknownPhoneModelError("(no model given)")
+    model = await config_service.resolve_phone_model(session, model_term)
     stmt = (
         select(Part)
         .join(PartTypeConfig, Part.part_type_id == PartTypeConfig.id)
@@ -287,22 +323,8 @@ async def find_part_by_type_and_model(session: AsyncSession, part_type_term: str
             selectinload(Part.source_donor),
             selectinload(Part.compatible_model_links),
         )
-        .where(PartTypeConfig.name.ilike(like_type), Part.status == "AVAILABLE")
+        .where(PartTypeConfig.name.ilike(f"%{part_type_term}%"), Part.status == "AVAILABLE")
         .order_by(Part.created_at.asc())
     )
     parts = (await session.execute(stmt)).scalars().all()
-    if not model_term:
-        return parts
-
-    needle = model_term.lower()
-    results: list[Part] = []
-    for p in parts:
-        if not p.compatible_model_links:
-            results.append(p)
-            continue
-        for link in p.compatible_model_links:
-            model = await session.get(PhoneModelConfig, link.phone_model_id)
-            if model and needle in f"{model.display_name()} {model.variant or ''}".lower():
-                results.append(p)
-                break
-    return results
+    return fitting_parts(parts, model.id)

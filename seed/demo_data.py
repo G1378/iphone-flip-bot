@@ -96,10 +96,14 @@ async def populate_demo_data(session: AsyncSession, ebay: EbayClientInterface) -
     # ---------------- Purchased parts order (received) ----------------
     battery_type = await config_service.get_or_create_part_type(session, "Battery")
     screen_type = await config_service.get_or_create_part_type(session, "Screen")
+    iphone_12 = await config_service.resolve_phone_model(session, "iPhone 12")
+    iphone_13_pro = await config_service.resolve_phone_model(session, "iPhone 13 Pro")
     order = await orders_service.create_order(
-        session, "MobileSentrix", [
-            orders_service.OrderLineInput(part_type_id=battery_type.id, quantity=2, unit_cost=Decimal("18.00")),
-            orders_service.OrderLineInput(part_type_id=screen_type.id, quantity=1, unit_cost=Decimal("55.00")),
+        session, "MobileSentrix", [  # every line is for ONE exact model
+            orders_service.OrderLineInput(part_type_id=battery_type.id, quantity=2, unit_cost=Decimal("18.00"),
+                                          phone_model_id=iphone_12.id),
+            orders_service.OrderLineInput(part_type_id=screen_type.id, quantity=1, unit_cost=Decimal("55.00"),
+                                          phone_model_id=iphone_13_pro.id),
         ],
         DEMO_ACTOR_ID, shipping_cost=Decimal("8.00"),
     )

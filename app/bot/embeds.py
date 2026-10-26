@@ -69,6 +69,7 @@ def donor_embed(donor, recovered_count: int = 0, discarded_count: int = 0) -> di
 
 def part_embed(part) -> discord.Embed:
     e = discord.Embed(title=f"{part.internal_id} — {part.part_type.name}", colour=BRAND_COLOUR)
+    e.add_field(name="Fits", value=part.model_label(), inline=True)
     e.add_field(name="Status", value=part.status, inline=True)
     e.add_field(name="Source", value=part.source_type.value, inline=True)
     if part.source_donor:
@@ -105,14 +106,14 @@ def repair_plan_embed(phone, plan) -> discord.Embed:
                     f"{c.location.code if c.location else 'no location'}{proven_bit}{donor_bit}{reserved_bit}"
                 )
             e.add_field(
-                name=f"{rp.required_part_type.name} × {rp.quantity} ({len(item.candidates)} candidate(s))",
+                name=f"{rp.required_part_type.name} for {phone.model} × {rp.quantity} ({len(item.candidates)} candidate(s))",
                 value="\n".join(lines), inline=False,
             )
             total += best.cost
         else:
             e.add_field(
-                name=f"{rp.required_part_type.name} × {rp.quantity}",
-                value="⚠️ No matching AVAILABLE part in stock — consider `/order`.",
+                name=f"{rp.required_part_type.name} for {phone.model} × {rp.quantity}",
+                value=f"⚠️ No {rp.required_part_type.name} for {phone.model} in stock — consider `/order`.",
                 inline=False,
             )
     e.add_field(name="Estimated parts cost (best candidates)", value=f"£{total}", inline=False)

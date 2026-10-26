@@ -72,7 +72,7 @@ class FinanceCog(commands.Cog):
         if needed:
             order_needed = [n for n in needed if n.to_order_qty > 0]
             if order_needed:
-                e.add_field(name="Parts to order", value="\n".join(f"{n.part_type.name} × {n.to_order_qty}" for n in order_needed[:10]), inline=False)
+                e.add_field(name="Parts to order", value="\n".join(f"{n.label} × {n.to_order_qty}" for n in order_needed[:10]), inline=False)
         e.add_field(name="Current stock value (phones+parts+donors)", value=f"{currency_symbol}{stock['total']}", inline=False)
         await interaction.response.send_message(embed=e)
 

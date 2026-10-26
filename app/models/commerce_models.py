@@ -4,7 +4,7 @@ import datetime as dt
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
@@ -69,6 +69,8 @@ class Listing(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     condition_text: Mapped[Optional[str]] = mapped_column(String(100))
+    condition_description: Mapped[Optional[str]] = mapped_column(Text)   # eBay "conditionDescription"
+    aspects: Mapped[Optional[dict]] = mapped_column(JSON)                # item specifics: {"Brand": ["Apple"], ...}
     category_id: Mapped[Optional[str]] = mapped_column(String(50))
     price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(6), default="GBP")

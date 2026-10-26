@@ -48,3 +48,8 @@ def actor_id() -> int:
 @pytest.fixture()
 def today() -> dt.date:
     return dt.date(2026, 9, 1)
+
+
+async def model_id(session, name: str = "iPhone 13") -> int:
+    """Catalog id of an exact model (parts and order lines must be for one)."""
+    return (await config_service.resolve_phone_model(session, name)).id

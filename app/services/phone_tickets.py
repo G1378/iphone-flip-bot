@@ -81,6 +81,8 @@ class Context:
     supply: dict[int, list[Unit]]  # RepairPart.id -> one Unit per quantity
     available: dict[int, list[Part]] = field(default_factory=dict)  # part_type_id -> AVAILABLE parts (all of them)
     failures: dict = field(default_factory=dict)  # (phone_id, part_type_id) -> part_failures.FailureInfo
+    drafts: dict = field(default_factory=dict)    # phone_id -> its open DRAFT eBay Listing
+    offer_terms: dict = field(default_factory=dict)  # phone_id -> listing_builder.BestOfferTerms for that draft
 
 
 def _active_repair(phone: Phone) -> Optional[Repair]:
@@ -105,7 +107,9 @@ async def _available_parts(session: AsyncSession) -> dict[int, list[Part]]:
 
 
 async def _orders_by_part_type(session: AsyncSession) -> dict[int, list[list]]:
-    """part_type_id -> [[order, units_still_to_arrive], ...], placed orders before drafts."""
+    """part_type_id -> [[order, units_still_to_arrive, phone_model_id], ...], placed orders
+    before drafts. Each slot is for ONE exact phone model: a Pro Max battery on order is
+    not a battery on order for a Pro."""
     rows = (await session.execute(
         select(OrderLine, Order).join(Order, OrderLine.order_id == Order.id)
         .where(Order.status.in_(("DRAFT", "ORDERED", "SHIPPED")), OrderLine.received_quantity < OrderLine.quantity)
@@ -113,7 +117,7 @@ async def _orders_by_part_type(session: AsyncSession) -> dict[int, list[list]]:
     )).all()
     out: dict[int, list[list]] = {}
     for line, order in rows:
-        out.setdefault(line.part_type_id, []).append([order, line.quantity - line.received_quantity])
+        out.setdefault(line.part_type_id, []).append([order, line.quantity - line.received_quantity, line.phone_model_id])
     for lst in out.values():
         lst.sort(key=lambda x: x[0].status == "DRAFT")  # stable: placed first
     return out
@@ -128,15 +132,16 @@ def allocate_supply(phones: Sequence[Phone], available: dict[int, list[Part]],
     don't both claim the single one in stock or the single one on order."""
     stock = {k: list(v) for k, v in available.items()}
     incoming = {k: [list(x) for x in v] for k, v in on_order.items()}
-    lines: list[tuple[dt.datetime, int, RepairPart]] = []
+    lines: list[tuple[dt.datetime, int, RepairPart, Optional[int]]] = []
     for phone in phones:
         repair = _active_repair(phone)
         for rp in _outstanding_lines(repair):
-            lines.append((repair.created_at or dt.datetime.min.replace(tzinfo=dt.timezone.utc), rp.id, rp))
+            lines.append((repair.created_at or dt.datetime.min.replace(tzinfo=dt.timezone.utc), rp.id, rp,
+                          phone.phone_model_id))
     lines.sort(key=lambda x: (x[0], x[1]))
 
     supply: dict[int, list[Unit]] = {}
-    for _, _, rp in lines:
+    for _, _, rp, model_id in lines:
         units: list[Unit] = []
         if rp.status == RepairPartLineStatus.RESERVED and rp.part is not None:
             units.append(Unit("RESERVED", part=rp.part))
@@ -145,10 +150,14 @@ def allocate_supply(phones: Sequence[Phone], available: dict[int, list[Part]],
             wanted = max(rp.quantity, 1)
         for _ in range(wanted):
             type_id = rp.required_part_type_id
-            if stock.get(type_id):
-                units.append(Unit("IN_STOCK", part=stock[type_id].pop(0)))
+            # Only a part tagged for THIS phone's exact model (or an order line for it) counts.
+            fit = next((p for p in stock.get(type_id, []) if p.fits_model(model_id)), None)
+            if fit is not None:
+                stock[type_id].remove(fit)
+                units.append(Unit("IN_STOCK", part=fit))
                 continue
-            slot = next((s for s in incoming.get(type_id, []) if s[1] > 0), None)
+            slot = next((s for s in incoming.get(type_id, [])
+                         if s[1] > 0 and model_id is not None and s[2] == model_id), None)
             if slot is not None:
                 slot[1] -= 1
                 units.append(Unit("DRAFTED" if slot[0].status == "DRAFT" else "ON_ORDER", order=slot[0]))
@@ -213,6 +222,11 @@ def _names(items, limit: int = 10) -> str:
     names = [i.name for i in items]
     extra = len(names) - limit
     return ", ".join(names[:limit]) + (f" … and {extra} more" if extra > 0 else "")
+
+
+def part_label(rp: RepairPart, phone: Phone) -> str:
+    """'Battery (iPhone 13 Pro)': the part and the exact model it has to be for."""
+    return f"{rp.required_part_type.name} ({phone.model})"
 
 
 def _where(part: Part) -> str:
@@ -296,11 +310,12 @@ def spec_for(sit: Situation, ctx: Context) -> TicketSpec:
             "• Photos: front, back, sides, screen on, battery health, IMEI, every flaw\n"
             f"• Check the price (`/analyse {pid}`)\n"
             "Press **Done** when it's ready to list (marks it Ready for listing)."), "NORMAL", due_days=2)
-    return TicketSpec("LIST", "🏷️ Create the eBay listing", (
-        f"Ready to sell. Create the listing (`/list {pid}`).\n"
-        "• Title with model, storage, colour, grade and battery %\n"
+    return TicketSpec("LIST", "🏷️ List it on eBay", (
+        "Ready to sell. The bot builds the listing from the phone's record:\n"
+        "• Post the photos here with `/photos` (front, back, screen on, battery health, every flaw)\n"
+        "• Press **Build eBay listing**, read it through, fix anything with **Edit listing**\n"
         "• Disclose any non-genuine parts or lock status\n"
-        "• Postage and returns policy set\n"
+        "• Press **Publish to eBay** when you're happy: nothing goes live until you do\n"
         "This closes by itself once the listing goes live."), "NORMAL", due_days=1)
 
 
@@ -321,7 +336,7 @@ def _repair_spec(sit: Situation, ctx: Context) -> TicketSpec:
     waiting: list[str] = []
     waiting_names: list[str] = []
     for rp in sit.outstanding:
-        name = rp.required_part_type.name
+        name = part_label(rp, sit.phone)
         for unit in ctx.supply.get(rp.id, []):
             if unit.kind == "RESERVED":
                 swap_now.append(f"• **{name}** → `{unit.part.internal_id}` · {_where(unit.part)} (reserved, ready to fit)")
@@ -409,7 +424,35 @@ async def load_phones(session: AsyncSession, only_phone_id: Optional[int] = None
     return list((await session.execute(stmt)).scalars().all())
 
 
+async def _drafts_by_phone(session: AsyncSession, phone_ids: Sequence[int]) -> dict:
+    from app.models.commerce_models import Listing
+    if not phone_ids:
+        return {}
+    rows = (await session.execute(
+        select(Listing).where(Listing.status == "DRAFT", Listing.phone_id.in_(list(phone_ids))).order_by(Listing.id)
+    )).scalars().all()
+    return {l.phone_id: l for l in rows}     # newest draft per phone wins
+
+
+async def _offer_terms(session: AsyncSession, phones: Sequence[Phone], drafts: dict) -> dict:
+    from app.services import listing_builder
+    out = {}
+    for p in phones:
+        if p.id in drafts:
+            try:
+                out[p.id] = await listing_builder.best_offer_terms(session, drafts[p.id], p)
+            except config_service.UnknownPhoneModelError:
+                pass
+    return out
+
+
 async def load_context(session: AsyncSession, phones: Sequence[Phone]) -> Context:
+    for phone in phones:  # older phones have no catalog link yet: link them if their model text is exact
+        if phone.phone_model_id is None:
+            try:
+                await config_service.phone_model_for(session, phone)
+            except config_service.UnknownPhoneModelError:
+                pass  # stays unmatched: nothing will be offered for it until the model is corrected
     overrides: dict[int, set[str]] = {}
     for o in (await session.execute(select(PhoneTicketOverride))).scalars().all():
         overrides.setdefault(o.phone_id, set()).add(o.stage)
@@ -420,6 +463,8 @@ async def load_context(session: AsyncSession, phones: Sequence[Phone]) -> Contex
         supply=allocate_supply(phones, available, await _orders_by_part_type(session)),
         available=available,
         failures=await part_failures.failure_info(session),
+        drafts=(drafts := await _drafts_by_phone(session, [p.id for p in phones])),
+        offer_terms=await _offer_terms(session, phones, drafts),
     )
 
 
@@ -552,7 +597,7 @@ async def preview_manual_complete(session: AsyncSession, phone: Phone, stage: st
         if not items:
             return "Nothing can be fitted yet: no reserved or in-stock parts for this repair."
         return "Mark these as **fitted and working** (reserving them first if needed):\n" + "\n".join(
-            f"• {rp.required_part_type.name} → `{part.internal_id}`" for rp, part in items)
+            f"• {part_label(rp, phone)} → `{part.internal_id}`" for rp, part in items)
     if stage == "VERIFY":
         return "Complete the repair and mark the phone **Ready for listing**."
     if stage == "PREP":

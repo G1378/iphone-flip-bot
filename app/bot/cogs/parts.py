@@ -7,11 +7,13 @@ from discord import app_commands
 from discord.ext import commands
 
 from app.bot.auth import require_authorized
+from app.bot.autocomplete import phone_model_autocomplete
 from app.bot.embeds import error_embed, part_embed, success_embed
 from app.bot.pagination import send_paginated
 from app.db import session_scope
 from app.models.enums import RepairPartLineStatus
 from app.services import allocation as allocation_service
+from app.services import config_service
 from app.services import parts as parts_service
 from app.services.part_failures import proven_tag
 from app.services import repairs as repairs_service
@@ -35,7 +37,7 @@ class PartsCog(commands.Cog):
     async def parts(self, interaction: discord.Interaction, status: Optional[str] = None):
         async with session_scope() as session:
             all_parts = await parts_service.search_parts(session, status.upper() if status else "")
-            items = [(p.internal_id, p.part_type.name if p.part_type else "?", p.status, p.cost,
+            items = [(p.internal_id, f"{p.part_type.name if p.part_type else '?'} · {p.model_label()}", p.status, p.cost,
                       p.location.code if p.location else "—") for p in all_parts]
 
         def render(page_items, page, total_pages):
@@ -62,12 +64,18 @@ class PartsCog(commands.Cog):
                 embed.add_field(name="Allocation history", value="\n".join(lines)[:1024], inline=False)
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="find-part", description="Find available parts by type and model, e.g. 'screen' '13 pro'")
+    @app_commands.command(name="find-part", description="Find available parts for one exact model, e.g. 'screen' 'iPhone 13 Pro'")
+    @app_commands.describe(part_type="e.g. screen, battery", model="Exact model (a 13 Pro screen is not a 13 screen)")
+    @app_commands.autocomplete(model=phone_model_autocomplete)
     @require_authorized()
-    async def find_part(self, interaction: discord.Interaction, part_type: str, model: str = ""):
+    async def find_part(self, interaction: discord.Interaction, part_type: str, model: str):
         async with session_scope() as session:
-            results = await parts_service.find_part_by_type_and_model(session, part_type, model)
-            items = [(p.internal_id, p.part_type.name if p.part_type else "?", proven_tag(p),
+            try:
+                results = await parts_service.find_part_by_type_and_model(session, part_type, model)
+            except config_service.UnknownPhoneModelError as e:
+                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                return
+            items = [(p.internal_id, f"{p.part_type.name if p.part_type else '?'} · {p.model_label()}", proven_tag(p),
                       p.location.code if p.location else "—", p.cost) for p in results]
 
         def render(page_items, page, total_pages):
@@ -81,6 +89,24 @@ class PartsCog(commands.Cog):
             return e
 
         await send_paginated(interaction, items, per_page=10, render=render)
+
+    @app_commands.command(name="part-models", description="Correct which phone model(s) a part fits (comma-separated)")
+    @app_commands.describe(part_id="e.g. PT-000012", models="e.g. 'iPhone 13 Pro' or 'iPhone 12, iPhone 12 Pro' if truly shared")
+    @require_authorized()
+    async def part_models(self, interaction: discord.Interaction, part_id: str, models: str):
+        async with session_scope() as session:
+            part = await parts_service.get_part(session, part_id)
+            if not part:
+                await interaction.response.send_message(embed=error_embed(f"No part found with ID `{part_id}`."), ephemeral=True)
+                return
+            try:
+                resolved = [await config_service.resolve_phone_model(session, m.strip()) for m in models.split(",") if m.strip()]
+                await parts_service.set_part_models(session, part, [m.id for m in resolved], interaction.user.id)
+            except (config_service.UnknownPhoneModelError, parts_service.PartStateError) as e:
+                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                return
+            label = part.model_label()
+        await interaction.response.send_message(embed=success_embed(f"{part_id} now fits: {label}"))
 
     @app_commands.command(name="reserve-part", description="Reserve a part against a repair's requirement")
     @require_authorized()
@@ -186,15 +212,15 @@ class PartsCog(commands.Cog):
             await interaction.response.send_message(embed=e)
             return
 
-        required_lines = "\n".join(f"{l.part_type.name} × {l.required_qty}" for l in lines)
-        stock_lines = "\n".join(f"{l.part_type.name} × {l.in_stock_qty}" for l in lines)
+        required_lines = "\n".join(f"{l.label} × {l.required_qty}" for l in lines)
+        stock_lines = "\n".join(f"{l.label} × {l.in_stock_qty}" for l in lines)
         order_lines = [l for l in lines if l.to_order_qty > 0]
         e.add_field(name="Required", value=required_lines or "—", inline=True)
         e.add_field(name="In stock", value=stock_lines or "—", inline=True)
         if order_lines:
             e.add_field(
                 name="⚠️ ORDER REQUIRED",
-                value="\n".join(f"{l.part_type.name} × {l.to_order_qty}" for l in order_lines),
+                value="\n".join(f"{l.label} × {l.to_order_qty}" for l in order_lines),
                 inline=False,
             )
             e.set_footer(text="Use /order to create a purchase order for the missing parts.")

@@ -16,6 +16,7 @@ from app.jobs.ebay_sync_job import sync_ebay_orders
 from app.jobs.pricing_sync_job import run_pricing_refresh
 from app.jobs.sheets_sync_job import run_sheets_sync
 from app.services import config_service
+from app.services import deals as deals_service
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ class SchedulerState:
     ebay: JobStatus = field(default_factory=lambda: JobStatus(name="ebay_sync"))
     sheets: JobStatus = field(default_factory=lambda: JobStatus(name="sheets_sync"))
     pricing: JobStatus = field(default_factory=lambda: JobStatus(name="pricing_sync"))
+    deals: JobStatus = field(default_factory=lambda: JobStatus(name="deal_scan"))
 
 
 class JobScheduler:
@@ -92,6 +94,14 @@ class JobScheduler:
             )
         else:
             logger.info("eBay Buy APIs not configured - background pricing sync job disabled.")
+
+        if self.ebay_client.buy_apis_configured and settings.deal_scan_interval_minutes > 0:
+            self.scheduler.add_job(
+                self._deals_tick, IntervalTrigger(minutes=settings.deal_scan_interval_minutes),
+                id="deal_scan", max_instances=1, coalesce=True,
+            )
+        else:
+            logger.info("Deal alerts off (eBay Buy APIs not configured, or DEAL_SCAN_INTERVAL_MINUTES=0).")
 
         self.scheduler.start()
 
@@ -155,6 +165,27 @@ class JobScheduler:
             status.last_success = False
             status.last_error = f"Unexpected error: {e}"
             logger.exception("Unexpected error during Sheets sync tick")
+
+    async def _deals_tick(self) -> None:
+        status = self.state.deals
+        status.last_run_at = dt.datetime.now(dt.timezone.utc)
+        try:
+            async with session_scope() as session:
+                result = await deals_service.scan_deals(session, self.ebay_client)
+                messages = [deals_service.format_alert(c) for c in result.candidates]
+            status.last_success = not result.errors
+            status.last_error = "; ".join(result.errors[:2]) or None
+            status.last_summary = (f"{result.watched} model(s) watched, {result.checked} listing(s) checked, "
+                                   f"{len(messages)} deal(s)")
+            for m in messages:
+                await self.notify_fn(m)
+        except EbayNotConfiguredError:
+            status.last_success = False
+            status.last_error = "eBay not configured"
+        except Exception as e:  # noqa: BLE001
+            status.last_success = False
+            status.last_error = f"Unexpected error: {e}"
+            logger.exception("Unexpected error during deal scan tick")
 
     async def _pricing_tick(self) -> None:
         status = self.state.pricing

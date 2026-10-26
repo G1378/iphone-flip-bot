@@ -7,11 +7,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from app.bot.autocomplete import phone_model_autocomplete
 from app.bot.auth import require_admin, require_authorized
 from app.bot.embeds import error_embed, success_embed
 from app.config import settings
 from app.db import session_scope
 from app.services import config_service
+from app.services import maintenance as maintenance_service
 
 ADD_REMOVE_LIST = [
     app_commands.Choice(name="add", value="add"),
@@ -20,11 +22,74 @@ ADD_REMOVE_LIST = [
 ]
 
 
+class WipeConfirmModal(discord.ui.Modal, title="Wipe ALL data?"):
+    confirm = discord.ui.TextInput(label="Type WIPE to confirm", required=True, max_length=10)
+
+    def __init__(self, include_config: bool):
+        super().__init__()
+        self.include_config = include_config
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if self.confirm.value.strip() != "WIPE":
+            await interaction.response.send_message(embed=error_embed("You didn't type WIPE, so nothing was deleted."), ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        cleaned = await _delete_discord_leftovers(interaction)
+        async with session_scope() as session:
+            result = await maintenance_service.wipe_all_data(session, include_config=self.include_config)
+        e = discord.Embed(title="🧹 All data wiped", colour=discord.Colour.orange())
+        e.description = (f"Deleted **{result.total}** rows across {len(result.rows_deleted)} tables. "
+                         "Phone, donor, part and order numbers start again from 1.\n"
+                         + ("Settings and catalogs were reset to defaults. " if self.include_config
+                            else "Settings, locations, part types, models and test checklist were kept. ")
+                         + "Authorized users and registered channels were not touched.")
+        if cleaned:
+            e.add_field(name="Discord clean-up", value=cleaned, inline=False)
+        await interaction.followup.send(embed=e)
+
+
+async def _delete_discord_leftovers(interaction: discord.Interaction) -> str:
+    """Best effort: remove the job channels and ticket messages the wipe is about to orphan.
+    Anything that fails is left for a person to delete by hand."""
+    from app.models.task_models import JobChannel, Task
+    from sqlalchemy import select
+    async with session_scope() as session:
+        channel_ids = list((await session.execute(select(JobChannel.channel_id))).scalars().all())
+        messages = [(c, m) for c, m in (await session.execute(
+            select(Task.discord_channel_id, Task.discord_message_id).where(Task.discord_message_id.is_not(None)))).all() if c]
+    client, deleted_channels, deleted_messages, failed = interaction.client, 0, 0, 0
+    for cid in channel_ids:
+        try:
+            ch = client.get_channel(cid) or await client.fetch_channel(cid)
+            await ch.delete(reason="/config wipe-data")
+            deleted_channels += 1
+        except Exception:
+            failed += 1
+    for cid, mid in messages:
+        try:
+            ch = client.get_channel(cid) or await client.fetch_channel(cid)
+            await (await ch.fetch_message(mid)).delete()
+            deleted_messages += 1
+        except Exception:
+            failed += 1
+    if not (channel_ids or messages):
+        return ""
+    return f"Deleted {deleted_channels} job channel(s) and {deleted_messages} ticket message(s)" + (
+        f"; {failed} couldn't be removed (already gone, or missing permission)." if failed else ".")
+
+
 class ConfigCog(commands.GroupCog, group_name="config"):
     """Admin-only settings: users, locations, tests, pricing, eBay, Sheets."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    # ------------------------------------------------------------------
+    @app_commands.command(name="wipe-data", description="DEV ONLY: delete every phone, part, order, sale and ticket and start again")
+    @app_commands.describe(include_settings="Also reset settings, locations, models, part types and the test checklist to defaults")
+    @require_admin()
+    async def wipe_data(self, interaction: discord.Interaction, include_settings: bool = False):
+        await interaction.response.send_modal(WipeConfirmModal(include_settings))
 
     # ------------------------------------------------------------------
     @app_commands.command(name="business", description="View or set a business setting (name, currency, fee assumptions, etc.)")
@@ -185,11 +250,11 @@ class ConfigCog(commands.GroupCog, group_name="config"):
                 m = await config_service.get_or_create_phone_model(session, "Apple", model)
                 if default_sale_price is not None:
                     m.default_sale_price = Decimal(str(default_sale_price))
-                await interaction.response.send_message(embed=success_embed(f"Model '{model}' saved" + (f" (default price £{default_sale_price})" if default_sale_price else "")))
+                await interaction.response.send_message(embed=success_embed(f"Model '{m.model}' saved" + (f" (default price £{default_sale_price})" if default_sale_price else "")))
             else:
                 models = await config_service.list_phone_models(session)
                 e = discord.Embed(title="📱 Phone models", colour=discord.Colour.blue())
-                e.description = "\n".join(f"• {m.model} (default price: £{m.default_sale_price or '—'})" for m in models) or "None configured."
+                e.description = "\n".join(f"• {m.model} (default price: £{m.default_sale_price or '—'})" for m in models)[:4000] or "None configured."
                 await interaction.response.send_message(embed=e)
 
     # ------------------------------------------------------------------
@@ -260,11 +325,16 @@ class ConfigCog(commands.GroupCog, group_name="config"):
 
     # ------------------------------------------------------------------
     @app_commands.command(name="pricing-rules", description="Manually override sale price/thresholds for one model (wins over live /pricing data)")
+    @app_commands.autocomplete(model=phone_model_autocomplete)
     @require_admin()
     async def pricing(self, interaction: discord.Interaction, model: str, default_sale_price: Optional[float] = None,
                        min_profit_gbp: Optional[float] = None, min_roi_pct: Optional[float] = None):
         async with session_scope() as session:
-            phone_model = await config_service.get_or_create_phone_model(session, "Apple", model)
+            try:
+                phone_model = await config_service.resolve_phone_model(session, model)
+            except config_service.UnknownPhoneModelError as e:
+                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                return
             from app.models.config_models import PricingRule
             from sqlalchemy import select
             rule = (await session.execute(select(PricingRule).where(PricingRule.phone_model_id == phone_model.id))).scalar_one_or_none()
@@ -280,6 +350,49 @@ class ConfigCog(commands.GroupCog, group_name="config"):
         await interaction.response.send_message(embed=success_embed(f"Pricing rule saved for {model}"))
 
     # ------------------------------------------------------------------
+    @app_commands.command(name="ebay-setup", description="Read your eBay postage/payment/returns policies + stock location and use them for listings")
+    @app_commands.describe(postage_policy_id="Pick one if you have several", payment_policy_id="Pick one if you have several",
+                           returns_policy_id="Pick one if you have several", location_key="Pick one if you have several",
+                           postcode="No stock location on eBay yet? Create one at this postcode")
+    @require_admin()
+    async def ebay_setup(self, interaction: discord.Interaction, postage_policy_id: Optional[str] = None,
+                         payment_policy_id: Optional[str] = None, returns_policy_id: Optional[str] = None,
+                         location_key: Optional[str] = None, postcode: Optional[str] = None):
+        from app.integrations.ebay.interface import EbayApiError, EbayNotConfiguredError
+        from app.services import listings as listings_service
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            async with session_scope() as session:
+                result = await listings_service.configure_publishing(session, self.bot.ebay_client, {
+                    "ebay_fulfillment_policy_id": postage_policy_id, "ebay_payment_policy_id": payment_policy_id,
+                    "ebay_return_policy_id": returns_policy_id, "ebay_merchant_location_key": location_key,
+                }, postcode=postcode)
+        except EbayNotConfiguredError:
+            await interaction.followup.send(embed=error_embed("eBay isn't connected yet (`/config ebay`)."), ephemeral=True)
+            return
+        except (EbayApiError, listings_service.ListingError) as e:
+            await interaction.followup.send(embed=error_embed(str(e)), ephemeral=True)
+            return
+        names = {"ebay_fulfillment_policy_id": ("Postage policy", "postage_policy_id"),
+                 "ebay_payment_policy_id": ("Payment policy", "payment_policy_id"),
+                 "ebay_return_policy_id": ("Returns policy", "returns_policy_id"),
+                 "ebay_merchant_location_key": ("Stock location", "location_key")}
+        e = discord.Embed(title="eBay listing setup", colour=discord.Colour.blue())
+        unresolved = False
+        for key, (label, arg) in names.items():
+            picked, options = result.chosen.get(key), result.options.get(key, [])
+            if picked:
+                e.add_field(name=f"✅ {label}", value=f"{picked.name}", inline=True)
+            else:
+                unresolved = True
+                listing = ", ".join(f"{o.name} (`{o.id}`)" for o in options) or "none found on your eBay account"
+                e.add_field(name=f"❌ {label}", value=f"Choose with `{arg}`: {listing}"[:1024], inline=False)
+        if result.created_location:
+            e.set_footer(text="Created a stock location called 'Workshop'.")
+        elif unresolved:
+            e.set_footer(text="Run it again, adding the ones that need choosing. No stock location? Add postcode:")
+        await interaction.followup.send(embed=e, ephemeral=True)
+
     @app_commands.command(name="ebay", description="Show eBay integration configuration status")
     @require_admin()
     async def ebay(self, interaction: discord.Interaction):

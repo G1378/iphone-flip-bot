@@ -27,6 +27,7 @@ INITIAL_COGS = [
     "app.bot.cogs.ebay",
     "app.bot.cogs.finance",
     "app.bot.cogs.pricing",
+    "app.bot.cogs.deals",
     "app.bot.cogs.config",
     "app.bot.cogs.search",
     "app.bot.cogs.tasks",

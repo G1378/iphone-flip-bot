@@ -6,6 +6,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from app.bot.autocomplete import phone_model_autocomplete
 from app.bot.auth import require_admin, require_authorized
 from app.bot.embeds import error_embed, success_embed
 from app.db import session_scope
@@ -135,23 +136,33 @@ class PricingCog(commands.GroupCog, group_name="pricing"):
         self.bot.add_view(RefreshButton())
 
     @app_commands.command(name="watch", description="Add a phone model (and optionally storage) to the pricing watchlist")
+    @app_commands.autocomplete(model=phone_model_autocomplete)
     @require_admin()
     async def watch(self, interaction: discord.Interaction, model: str, storage: Optional[str] = None):
         async with session_scope() as session:
-            phone_model = await config_service.get_or_create_phone_model(session, "Apple", model)
+            try:
+                phone_model = await config_service.resolve_phone_model(session, model)
+            except config_service.UnknownPhoneModelError as e:
+                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                return
             await pricing_service.add_to_watchlist(session, phone_model, storage, interaction.user.id)
         await interaction.response.send_message(
-            embed=success_embed(f"Watching {model}" + (f" {storage}" if storage else "") + " for pricing.")
+            embed=success_embed(f"Watching {phone_model.model}" + (f" {storage}" if storage else "") + " for pricing.")
         )
 
     @app_commands.command(name="unwatch", description="Remove a phone model (and optional storage) from the pricing watchlist")
+    @app_commands.autocomplete(model=phone_model_autocomplete)
     @require_admin()
     async def unwatch(self, interaction: discord.Interaction, model: str, storage: Optional[str] = None):
         async with session_scope() as session:
-            phone_model = await config_service.get_or_create_phone_model(session, "Apple", model)
+            try:
+                phone_model = await config_service.resolve_phone_model(session, model)
+            except config_service.UnknownPhoneModelError as e:
+                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                return
             removed = await pricing_service.remove_from_watchlist(session, phone_model, storage, interaction.user.id)
         if removed:
-            await interaction.response.send_message(embed=success_embed(f"Stopped watching {model}" + (f" {storage}" if storage else "")))
+            await interaction.response.send_message(embed=success_embed(f"Stopped watching {phone_model.model}" + (f" {storage}" if storage else "")))
         else:
             await interaction.response.send_message(embed=error_embed("That model/storage wasn't on the watchlist."), ephemeral=True)
 

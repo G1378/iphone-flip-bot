@@ -31,7 +31,7 @@ class SearchCog(commands.Cog):
             )[:1024], inline=False)
         if results.parts:
             e.add_field(name="🔩 Parts", value="\n".join(
-                f"`{p.internal_id}` {p.part_type.name if p.part_type else '?'} — {p.status}" for p in results.parts
+                f"`{p.internal_id}` {p.display_name()} — {p.status}" for p in results.parts
             )[:1024], inline=False)
         if results.donors:
             e.add_field(name="🔧 Donors", value="\n".join(

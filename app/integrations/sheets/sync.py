@@ -23,7 +23,7 @@ SHEET_SPECS: dict[str, list[str]] = {
                "purchase_price", "acquisition_type", "purchase_date", "updated_at"],
     "DONORS": ["internal_id", "model", "storage", "colour", "purchase_price", "status",
                "fault_description", "purchase_date", "updated_at"],
-    "PARTS": ["internal_id", "part_type", "source_type", "source_donor", "cost", "grade",
+    "PARTS": ["internal_id", "part_type", "fits_models", "source_type", "source_donor", "cost", "grade",
               "testing_status", "location", "status", "installed_phone", "updated_at"],
     "REPAIRS": ["internal_id", "phone", "status", "labour_cost", "external_repair_cost",
                 "parts_cost", "total_cost", "started_at", "completed_at"],
@@ -69,7 +69,7 @@ async def _rows_parts(session: AsyncSession) -> list[list[str]]:
     )
     parts = (await session.execute(stmt)).scalars().all()
     return [
-        [p.internal_id, p.part_type.name if p.part_type else "", p.source_type.value,
+        [p.internal_id, p.part_type.name if p.part_type else "", p.model_label(), p.source_type.value,
          p.source_donor.internal_id if p.source_donor else "", _s(p.cost), _s(p.grade_code),
          p.testing_status.value, p.location.code if p.location else "", p.status,
          p.installed_phone.internal_id if p.installed_phone else "", _s(p.updated_at)]

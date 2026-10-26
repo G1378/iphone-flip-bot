@@ -10,21 +10,26 @@ from discord import app_commands
 from discord.ext import commands
 
 from app.bot.auth import require_authorized
+from app.bot.autocomplete import phone_model_autocomplete
 from app.bot.embeds import donor_embed, error_embed, success_embed
 from app.bot.pagination import send_paginated
 from app.bot.views import ConfirmView
 from app.db import session_scope
 from app.models.enums import TestOutcome
 from app.services import allocation as allocation_service
+from app.services import config_service
 from app.services import donors as donors_service
 
 
 class BuyDonorModal(discord.ui.Modal, title="Buy a donor phone"):
-    model = discord.ui.TextInput(label="Model (e.g. iPhone 13 Pro)", required=True, max_length=80)
     storage_colour = discord.ui.TextInput(label="Storage & Colour (e.g. 128GB Graphite)", required=False, max_length=60)
     price_source = discord.ui.TextInput(label="Purchase price & source (e.g. 180.00 / CEX)", required=True, max_length=100)
     fault = discord.ui.TextInput(label="Fault (why it's a donor, not resale)", required=True, max_length=200)
     notes = discord.ui.TextInput(label="Notes (optional)", required=False, style=discord.TextStyle.paragraph, max_length=500)
+
+    def __init__(self, model: str):
+        super().__init__()
+        self.model_name = model  # an exact catalog model, already checked by /donor
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
@@ -41,11 +46,15 @@ class BuyDonorModal(discord.ui.Modal, title="Buy a donor phone"):
 
         async with session_scope() as session:
             data = donors_service.BuyDonorInput(
-                manufacturer="Apple", model=self.model.value.strip(), variant=None, storage=storage, colour=colour,
+                manufacturer="Apple", model=self.model_name, variant=None, storage=storage, colour=colour,
                 purchase_price=price, purchase_date=dt.date.today(), seller_source=source.strip() or None,
                 fault_description=self.fault.value, notes=self.notes.value or None, location_code=None,
             )
-            donor = await donors_service.buy_donor(session, data, interaction.user.id)
+            try:
+                donor = await donors_service.buy_donor(session, data, interaction.user.id)
+            except config_service.UnknownPhoneModelError as e:
+                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                return
             embed = donor_embed(donor)
         embed.title = f"✅ Bought donor — {embed.title}"
         await interaction.response.send_message(embed=embed)
@@ -151,7 +160,7 @@ class TeardownView(discord.ui.View):
             created = await donors_service.teardown(session, donor, recovered, interaction.user.id)
 
         e = discord.Embed(title=f"✅ Teardown complete — {donor.internal_id}", colour=discord.Colour.green())
-        lines = [f"`{part.internal_id}` — {part.part_type.name if part.part_type else '?'}" for part in created]
+        lines = [f"`{part.internal_id}` — {part.display_name()}" for part in created]
         e.add_field(name="Parts created", value="\n".join(lines)[:1024] or "none", inline=False)
         e.add_field(
             name="Next step", value=f"Run `/allocate-cost donor_id:{donor.internal_id}` to allocate the donor's "
@@ -254,9 +263,17 @@ class DonorsCog(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="donor", description="Buy a donor phone (for parts harvesting)")
+    @app_commands.describe(model="Exact model: its parts only fit that model, not its Pro/Plus/mini siblings")
+    @app_commands.autocomplete(model=phone_model_autocomplete)
     @require_authorized()
-    async def donor(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(BuyDonorModal())
+    async def donor(self, interaction: discord.Interaction, model: str):
+        async with session_scope() as session:
+            try:
+                catalog = await config_service.resolve_phone_model(session, model)
+            except config_service.UnknownPhoneModelError as e:
+                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                return
+        await interaction.response.send_modal(BuyDonorModal(catalog.model))
 
     @app_commands.command(name="donors", description="List donor phones")
     @require_authorized()
@@ -304,7 +321,7 @@ class DonorsCog(commands.Cog):
                 status_line = f"{p.status} · £{p.cost}"
                 if p.installed_phone_id:
                     status_line += f" · installed in phone #{p.installed_phone_id}"
-                embed.add_field(name=f"{p.internal_id} — {p.part_type.name if p.part_type else '?'}", value=status_line, inline=True)
+                embed.add_field(name=f"{p.internal_id} — {p.display_name()}", value=status_line, inline=True)
             embed.add_field(name="Unallocated donor cost", value=f"£{unallocated}", inline=False)
         await interaction.response.send_message(embed=embed)
 

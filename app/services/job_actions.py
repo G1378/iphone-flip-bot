@@ -18,6 +18,7 @@ from app.models.enums import FaultStatus, RepairPartLineStatus
 from app.models.inventory_models import Part, Phone
 from app.models.repair_models import RepairPart
 from app.services import config_service
+from app.services import deals as deals_service
 from app.services import orders as orders_service
 from app.services import part_failures
 from app.services import parts as parts_service
@@ -61,38 +62,43 @@ async def reserve(session: AsyncSession, phone_id: int, rp_id: int, actor: int, 
     phone = await _phone(session, phone_id)
     rp = await _line(session, rp_id, phone_id)
     if rp.status == RepairPartLineStatus.RESERVED:
-        raise JobActionError(f"{rp.required_part_type.name} is already reserved.")
+        raise JobActionError(f"{phone_tickets.part_label(rp, phone)} is already reserved.")
     if part_id is not None:
         part = await session.get(Part, part_id)
+        if part is not None:
+            try:  # a part picked by hand must still be for this phone's exact model
+                await parts_service.assert_part_fits(session, part, phone)
+            except parts_service.PartStateError as e:
+                raise JobActionError(str(e))
     else:
         _, units = await _supply(session, phone, rp)
         part = next((u.part for u in units if u.kind == "IN_STOCK"), None)
     if part is None:
-        raise JobActionError(f"There's no {rp.required_part_type.name} in stock to reserve.")
+        raise JobActionError(f"There's no {phone_tickets.part_label(rp, phone)} in stock to reserve.")
     try:
         await parts_service.reserve_part(session, part, rp.repair, rp, actor)
     except parts_service.PartStateError as e:
         raise JobActionError(str(e))
-    return f"Reserved `{part.internal_id}` for {rp.required_part_type.name}. Fit it, then press **Fitted**."
+    return f"Reserved `{part.internal_id}` for {phone_tickets.part_label(rp, phone)}. Fit it, then press **Fitted**."
 
 
 async def alternatives(session: AsyncSession, phone_id: int, rp_id: int) -> list[Part]:
     phone = await _phone(session, phone_id)
     rp = await _line(session, rp_id, phone_id)
     ctx, _ = await _supply(session, phone, rp)
-    return list(ctx.available.get(rp.required_part_type_id, []))
+    return parts_service.fitting_parts(ctx.available.get(rp.required_part_type_id, []), phone.phone_model_id)
 
 
 async def fit(session: AsyncSession, phone_id: int, rp_id: int, actor: int) -> str:
     phone = await _phone(session, phone_id)
     rp = await _line(session, rp_id, phone_id)
     if rp.status != RepairPartLineStatus.RESERVED or rp.part is None:
-        raise JobActionError(f"Reserve the {rp.required_part_type.name} first.")
+        raise JobActionError(f"Reserve the {phone_tickets.part_label(rp, phone)} first.")
     try:
         await parts_service.install_part(session, rp.part, phone, rp, actor)
     except parts_service.PartStateError as e:
         raise JobActionError(str(e))
-    return f"Fitted `{rp.part.internal_id}` ({rp.required_part_type.name})."
+    return f"Fitted `{rp.part.internal_id}` ({phone_tickets.part_label(rp, phone)})."
 
 
 async def fit_confirmed(session: AsyncSession, phone_id: int, rp_id: int, actor: int) -> str:
@@ -102,7 +108,7 @@ async def fit_confirmed(session: AsyncSession, phone_id: int, rp_id: int, actor:
     await fit(session, phone_id, rp_id, actor)
     part = await session.get(Part, rp.part_id, populate_existing=True)
     await part_failures.confirm_working(session, part, phone, actor)
-    return f"Fitted `{part.internal_id}` ({rp.required_part_type.name}) ✅ confirmed working."
+    return f"Fitted `{part.internal_id}` ({phone_tickets.part_label(rp, phone)}) ✅ confirmed working."
 
 
 async def fail_fit(session: AsyncSession, phone_id: int, rp_id: int, actor: int, *, action: str,
@@ -111,14 +117,14 @@ async def fail_fit(session: AsyncSession, phone_id: int, rp_id: int, actor: int,
     phone = await _phone(session, phone_id)
     rp = await _line(session, rp_id, phone_id)
     if rp.status != RepairPartLineStatus.RESERVED or rp.part_id is None:
-        raise JobActionError(f"There's no reserved {rp.required_part_type.name} to mark as failed.")
+        raise JobActionError(f"There's no reserved {phone_tickets.part_label(rp, phone)} to mark as failed.")
     part = await session.get(Part, rp.part_id, populate_existing=True)
     try:
         failure = await part_failures.record_failure(session, part=part, phone=phone, repair_part=rp, action=action,
                                                      reason=reason, actor=actor, installed=False)
     except part_failures.PartFailureError as e:
         raise JobActionError(str(e))
-    return await _failure_message(session, part, rp.required_part_type.name, failure, phone)
+    return await _failure_message(session, part, phone_tickets.part_label(rp, phone), failure, phone)
 
 
 async def _failure_message(session: AsyncSession, part: Part, type_name: str, failure, phone: Phone) -> str:
@@ -153,7 +159,7 @@ async def unfit(session: AsyncSession, phone_id: int, part_id: int, actor: int, 
                                                          action=disposition, reason=reason, actor=actor, installed=True)
         except part_failures.PartFailureError as e:
             raise JobActionError(str(e))
-        return await _failure_message(session, part, line.required_part_type.name, failure, phone)
+        return await _failure_message(session, part, phone_tickets.part_label(line, phone), failure, phone)
     try:
         await parts_service.remove_part(session, part, line, actor, notes="Removed from job channel")
     except parts_service.PartStateError as e:
@@ -161,7 +167,7 @@ async def unfit(session: AsyncSession, phone_id: int, part_id: int, actor: int, 
     repair.parts.append(RepairPart(required_part_type_id=line.required_part_type_id, quantity=1,
                                    status=RepairPartLineStatus.REQUIRED))
     await session.flush()
-    return f"Removed `{part.internal_id}` back to stock. {line.required_part_type.name} is back on the list."
+    return f"Removed `{part.internal_id}` back to stock. {phone_tickets.part_label(line, phone)} is back on the list."
 
 
 def fitted_parts(repair) -> list[tuple[RepairPart, Part]]:
@@ -242,12 +248,15 @@ async def order_part(session: AsyncSession, phone_id: int, rp_id: int, actor: in
     rp = await _line(session, rp_id, phone_id)
     _, units = await _supply(session, phone, rp)
     if not any(u.kind == "TO_ORDER" for u in units):
-        raise JobActionError(f"{rp.required_part_type.name} is already covered by stock or an order.")
+        raise JobActionError(f"{phone_tickets.part_label(rp, phone)} is already covered by stock or an order.")
     supplier = (supplier or "").strip()
     if not supplier:
         raise JobActionError("Who are you ordering it from?")
     cost = _money(unit_cost, "Price")
-    model = await config_service.get_or_create_phone_model(session, phone.manufacturer, phone.model, phone.variant)
+    try:
+        model = await config_service.phone_model_for(session, phone)
+    except config_service.UnknownPhoneModelError as e:
+        raise JobActionError(f"Can't order for {phone.internal_id}: {e}")
     order = await orders_service.create_order(
         session, supplier,
         [orders_service.OrderLineInput(part_type_id=rp.required_part_type_id, quantity=1, unit_cost=cost,
@@ -256,7 +265,7 @@ async def order_part(session: AsyncSession, phone_id: int, rp_id: int, actor: in
         notes=f"For {phone.internal_id}")
     await orders_service.mark_ordered(session, order, actor)
     eta = f", due {order.expected_delivery.isoformat()}" if order.expected_delivery else ""
-    return f"Ordered {rp.required_part_type.name} from {supplier}: `{order.internal_id}` £{cost}{eta}."
+    return f"Ordered {phone_tickets.part_label(rp, phone)} from {supplier}: `{order.internal_id}` £{cost}{eta}."
 
 
 async def receive(session: AsyncSession, order_id: int, actor: int) -> str:
@@ -340,3 +349,81 @@ async def move(session: AsyncSession, phone_id: int, actor: int, location_code: 
         raise JobActionError("Where is it going?")
     await phones_service.move_phone(session, phone, code, actor)
     return f"Moved to {code}."
+
+
+# ---------------------------------------------------------------- eBay listing
+async def _draft(session: AsyncSession, phone_id: int, listing_id: int):
+    from app.models.commerce_models import Listing
+    listing = await session.get(Listing, listing_id, populate_existing=True)
+    if listing is None or listing.phone_id != phone_id or listing.status != "DRAFT":
+        raise JobActionError("That draft listing isn't there any more: press **Build eBay listing** again.")
+    return listing
+
+
+async def build_listing(session: AsyncSession, phone_id: int, actor: int) -> str:
+    """Write the eBay listing from the phone's record (or rewrite the open draft)."""
+    from app.services import listings as listings_service
+    phone = await _phone(session, phone_id)
+    draft, built = await listings_service.build_or_refresh_draft(session, phone, actor)
+    price = f"£{draft.price}" if draft.price and draft.price > 0 else "no price yet"
+    msg = f"Built {draft.internal_id}: **{draft.title}** · {price}."
+    if built.warnings:
+        msg += "\n" + "\n".join(f"⚠️ {w}" for w in built.warnings)
+    return msg
+
+
+async def edit_listing(session: AsyncSession, phone_id: int, listing_id: int, actor: int, *, title: str,
+                       price: str, condition_text: str, description: str) -> str:
+    listing = await _draft(session, phone_id, listing_id)
+    try:
+        value = Decimal(price.strip().lstrip("£"))
+    except InvalidOperation:
+        raise JobActionError(f"Couldn't read '{price}' as a price.")
+    if value <= 0:
+        raise JobActionError("The price has to be more than £0.")
+    if not title.strip():
+        raise JobActionError("The title can't be empty.")
+    listing.title = title.strip()[:80]
+    listing.price = value
+    listing.condition_text = condition_text.strip() or listing.condition_text
+    listing.description = description.strip() or listing.description
+    await session.flush()
+    return f"Updated {listing.internal_id}: **{listing.title}** · £{listing.price}."
+
+
+async def publish_listing(session: AsyncSession, phone_id: int, listing_id: int, actor: int, ebay) -> str:
+    """Push the draft live. The button is the person's decision; this just does it."""
+    from app.integrations.ebay.interface import EbayApiError, EbayNotConfiguredError
+    from app.services import listings as listings_service
+    listing = await _draft(session, phone_id, listing_id)
+    try:
+        published = await listings_service.publish(session, listing, ebay, actor)
+    except EbayNotConfiguredError:
+        raise JobActionError("eBay isn't connected yet (see `/config ebay`). The draft is saved.")
+    except listings_service.ListingNotReady as e:
+        raise JobActionError(str(e))
+    except EbayApiError as e:
+        raise JobActionError(f"eBay refused it: {e}")
+    return f"🚀 Published {published.internal_id} at £{published.price}: {published.ebay_url or published.ebay_listing_id}"
+
+
+async def find_ebay_parts(session: AsyncSession, phone_id: int, ebay) -> str:
+    """Cheapest eBay listings for every part this phone still has to order: exact model only."""
+    from app.integrations.ebay.interface import EbayApiError, EbayNotConfiguredError
+    phone = await _phone(session, phone_id)
+    ctx = await phone_tickets.load_context(session, [phone])
+    model = await config_service.phone_model_for(session, phone)
+    wanted = [rp for rp in (phone_tickets.assess(phone, ctx).outstanding)
+              if ctx.supply.get(rp.id) and ctx.supply[rp.id][0].kind == "TO_ORDER"]
+    if not wanted:
+        raise JobActionError("Nothing here needs ordering.")
+    blocks = []
+    try:
+        for rp in wanted:
+            offers = await deals_service.find_parts_on_ebay(session, ebay, rp.required_part_type.name, model)
+            blocks.append(deals_service.format_part_offers(rp.required_part_type.name, model, offers))
+    except EbayNotConfiguredError:
+        raise JobActionError("eBay isn't connected yet (see `/config ebay`).")
+    except EbayApiError as e:
+        raise JobActionError(f"eBay search failed: {e}")
+    return "\n\n".join(blocks)

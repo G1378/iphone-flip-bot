@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 
 from app.models.enums import AcquisitionType, PartSourceType, RepairPartLineStatus, TestOutcome
+from tests.conftest import model_id
 from app.services import config_service, parts, phones, repairs
 
 
@@ -22,10 +23,11 @@ async def _make_phone_needing_screen(session, actor_id, today):
     return phone
 
 
-async def _make_available_screen_part(session, actor_id, cost="70.00"):
+async def _make_available_screen_part(session, actor_id, cost="70.00", model="iPhone 13 Pro"):
     data = parts.CreatePartInput(
         part_type_name="Screen", source_type=PartSourceType.DONOR, cost=Decimal(cost),
         condition="Good", grade_code="A-", testing_status=TestOutcome.PASS,
+        compatible_model_ids=[await model_id(session, model)],
     )
     return await parts.create_part(session, data, actor_id)
 

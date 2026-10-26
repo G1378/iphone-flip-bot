@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.enums import InventoryEventType, PartSourceType, TestOutcome
-from app.models.inventory_models import Donor, Part
+from app.models.inventory_models import Donor, Part, PartCompatibleModel
 from app.services import config_service
 from app.services.events import log_event
 from app.services.ids import next_internal_id
@@ -43,7 +43,7 @@ class RecoveredPartInput:
 
 
 async def buy_donor(session: AsyncSession, data: BuyDonorInput, actor_discord_id: int) -> Donor:
-    await config_service.get_or_create_phone_model(session, data.manufacturer, data.model, data.variant)
+    catalog = await config_service.resolve_phone_model(session, data.model, data.variant)
     location = None
     if data.location_code:
         location = await config_service.get_location_by_code(session, data.location_code)
@@ -51,9 +51,10 @@ async def buy_donor(session: AsyncSession, data: BuyDonorInput, actor_discord_id
     internal_id = await next_internal_id(session, "donor")
     donor = Donor(
         internal_id=internal_id,
-        manufacturer=data.manufacturer,
-        model=data.model,
-        variant=data.variant,
+        manufacturer=catalog.manufacturer,
+        model=catalog.model,
+        variant=catalog.variant,
+        phone_model_id=catalog.id,
         storage=data.storage,
         colour=data.colour,
         purchase_price=data.purchase_price,
@@ -105,6 +106,8 @@ async def teardown(
     the full teardown yield remains queryable. Cost allocation happens
     separately via services.allocation (spec section 11)."""
     created: list[Part] = []
+    # Every recovered part came out of this donor, so it fits the donor's exact model.
+    donor_model = await config_service.phone_model_for(session, donor)
     for item in recovered:
         part_type = await config_service.get_or_create_part_type(session, item.part_type_name)
         location = None
@@ -128,6 +131,9 @@ async def teardown(
         )
         session.add(part)
         await session.flush()
+        session.add(PartCompatibleModel(part_id=part.id, phone_model_id=donor_model.id))
+        await session.flush()
+        await session.refresh(part, ["compatible_model_links"])
         created.append(part)
 
         await log_event(
@@ -138,7 +144,8 @@ async def teardown(
             actor_discord_id=actor_discord_id,
             related_entity_type="DONOR",
             related_entity_id=donor.internal_id,
-            new_state={"part_type": part_type.name, "status": part.status, "test_result": item.test_result.value},
+            new_state={"part_type": part_type.name, "model": donor_model.model, "status": part.status,
+                       "test_result": item.test_result.value},
             notes="Recovered from donor teardown" if not item.discarded else "Discarded during teardown",
         )
 

@@ -22,6 +22,8 @@ from app.services.phone_tickets import PhoneTicketError
 from app.services.task_templates import GENERAL_TEMPLATES
 from app.services.tasks import TaskError
 
+from tests.conftest import model_id
+
 
 # ------------------------------------------------------------------ helpers
 async def _buy(session, actor_id):
@@ -56,16 +58,17 @@ async def _pass_everything(session, phone, actor_id, except_codes=()):
             await testing_service.record_and_apply(session, phone, d, TestOutcome.PASS, actor_id)
 
 
-async def _stock(session, actor_id, part_type: str, location: str | None = None):
+async def _stock(session, actor_id, part_type: str, location: str | None = None, model: str = "iPhone 13"):
     return await parts_service.create_part(session, parts_service.CreatePartInput(
         part_type_name=part_type, source_type=PartSourceType.EXISTING_STOCK, cost=Decimal("30"),
-        location_code=location), actor_id)
+        location_code=location, compatible_model_ids=[await model_id(session, model)]), actor_id)
 
 
-async def _order(session, actor_id, part_type: str, placed: bool = True):
+async def _order(session, actor_id, part_type: str, placed: bool = True, model: str = "iPhone 13"):
     pt = await config_service.get_or_create_part_type(session, part_type)
     order = await orders_service.create_order(
-        session, "Supplier", [orders_service.OrderLineInput(part_type_id=pt.id, quantity=1, unit_cost=Decimal("25"))],
+        session, "Supplier", [orders_service.OrderLineInput(
+            part_type_id=pt.id, quantity=1, unit_cost=Decimal("25"), phone_model_id=await model_id(session, model))],
         actor_id, expected_delivery=dt.date(2026, 11, 2))
     if placed:
         await orders_service.mark_ordered(session, order, actor_id)

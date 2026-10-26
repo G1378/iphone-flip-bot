@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     ebay_sync_interval_minutes: int = 15
     sheets_sync_interval_minutes: int = 10
     pricing_sync_interval_days: int = 7
+    deal_scan_interval_minutes: int = 30   # 0 = no automatic deal alerts
 
     @property
     def ebay_configured(self) -> bool:

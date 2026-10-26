@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     Date,
@@ -31,6 +32,9 @@ class Phone(Base, TimestampMixin):
     manufacturer: Mapped[str] = mapped_column(String(50), default="Apple")
     model: Mapped[str] = mapped_column(String(80), nullable=False)
     variant: Mapped[Optional[str]] = mapped_column(String(50))
+    # The exact catalog model ("iPhone 13 Pro" is not "iPhone 13"). Parts are matched
+    # to a phone through this id, never through the free-text `model` above.
+    phone_model_id: Mapped[Optional[int]] = mapped_column(ForeignKey("phone_models.id"), index=True)
     storage: Mapped[Optional[str]] = mapped_column(String(20))   # "128GB"
     colour: Mapped[Optional[str]] = mapped_column(String(40))
 
@@ -41,6 +45,8 @@ class Phone(Base, TimestampMixin):
     lock_status: Mapped[LockStatus] = mapped_column(default=LockStatus.UNKNOWN)
 
     battery_health: Mapped[Optional[int]] = mapped_column()  # percentage
+    # eBay-hosted photo URLs, in the order they'll show on a listing (first = main image).
+    photo_urls: Mapped[Optional[list]] = mapped_column(JSON)
     cosmetic_condition: Mapped[Optional[str]] = mapped_column(String(100))
     functional_condition: Mapped[Optional[str]] = mapped_column(String(100))
 
@@ -55,6 +61,7 @@ class Phone(Base, TimestampMixin):
     notes: Mapped[Optional[str]] = mapped_column(Text)
 
     location: Mapped[Optional["Location"]] = relationship(lazy="selectin")
+    catalog_model: Mapped[Optional["PhoneModelConfig"]] = relationship(lazy="selectin", foreign_keys=[phone_model_id])
     faults: Mapped[list["PhoneFault"]] = relationship(lazy="selectin", back_populates="phone", cascade="all, delete-orphan")
     test_results: Mapped[list["TestResult"]] = relationship(lazy="selectin", back_populates="phone", cascade="all, delete-orphan")
     repairs: Mapped[list["Repair"]] = relationship(lazy="selectin", back_populates="phone")
@@ -81,6 +88,7 @@ class Donor(Base, TimestampMixin):
     manufacturer: Mapped[str] = mapped_column(String(50), default="Apple")
     model: Mapped[str] = mapped_column(String(80), nullable=False)
     variant: Mapped[Optional[str]] = mapped_column(String(50))
+    phone_model_id: Mapped[Optional[int]] = mapped_column(ForeignKey("phone_models.id"), index=True)
     storage: Mapped[Optional[str]] = mapped_column(String(20))
     colour: Mapped[Optional[str]] = mapped_column(String(40))
     imei: Mapped[Optional[str]] = mapped_column(String(20))
@@ -98,6 +106,7 @@ class Donor(Base, TimestampMixin):
     notes: Mapped[Optional[str]] = mapped_column(Text)
 
     location: Mapped[Optional["Location"]] = relationship(lazy="selectin")
+    catalog_model: Mapped[Optional["PhoneModelConfig"]] = relationship(lazy="selectin", foreign_keys=[phone_model_id])
     parts_recovered: Mapped[list["Part"]] = relationship(lazy="selectin", back_populates="source_donor")
     cost_allocations: Mapped[list["CostAllocation"]] = relationship(lazy="selectin", back_populates="donor")
 
@@ -113,6 +122,8 @@ class PartCompatibleModel(Base):
 
     part_id: Mapped[int] = mapped_column(ForeignKey("parts.id"), primary_key=True)
     phone_model_id: Mapped[int] = mapped_column(ForeignKey("phone_models.id"), primary_key=True)
+
+    phone_model: Mapped["PhoneModelConfig"] = relationship(lazy="selectin")
 
 
 class Part(Base, TimestampMixin):
@@ -161,8 +172,24 @@ class Part(Base, TimestampMixin):
     compatible_model_links: Mapped[list["PartCompatibleModel"]] = relationship(lazy="selectin", cascade="all, delete-orphan")
     cost_allocations: Mapped[list["CostAllocation"]] = relationship(lazy="selectin", back_populates="part")
 
+    def compatible_model_ids(self) -> set[int]:
+        return {link.phone_model_id for link in self.compatible_model_links}
+
+    def fits_model(self, phone_model_id: Optional[int]) -> bool:
+        """True only if this part is explicitly tagged for that exact model.
+
+        A part with no tags fits NOTHING (there is no "universal" part), and a
+        phone with no catalog model can't be matched to anything.
+        """
+        return phone_model_id is not None and phone_model_id in self.compatible_model_ids()
+
+    def model_label(self) -> str:
+        names = sorted(l.phone_model.model for l in self.compatible_model_links if l.phone_model)
+        return " / ".join(names) if names else "NO MODEL SET"
+
     def display_name(self) -> str:
-        return self.part_type.name if self.part_type else "Part"
+        """e.g. 'Battery (iPhone 13 Pro)'."""
+        return f"{self.part_type.name if self.part_type else 'Part'} ({self.model_label()})"
 
 
 class PhoneFault(Base, TimestampMixin):

@@ -13,10 +13,13 @@ from app.config import settings
 from app.integrations.ebay.interface import (
     EbayApiError,
     EbayClientInterface,
+    EbayItem,
     EbayOrder,
     EbayOrderLineItem,
     ListingResult,
+    PolicyInfo,
     PriceStats,
+    PublishingSetup,
 )
 
 logger = logging.getLogger(__name__)
@@ -208,49 +211,66 @@ class EbayClient(EbayClientInterface):
     async def create_listing(
         self, *, sku: str, title: str, description: str, price: Decimal, currency: str,
         quantity: int, condition_text: str, category_id: Optional[str],
+        condition_description: Optional[str] = None, aspects: Optional[dict[str, list[str]]] = None,
+        image_urls: Optional[list[str]] = None, fulfillment_policy_id: Optional[str] = None,
+        payment_policy_id: Optional[str] = None, return_policy_id: Optional[str] = None,
+        merchant_location_key: Optional[str] = None, best_offer_enabled: bool = False,
+        best_offer_auto_decline: Optional[Decimal] = None, best_offer_auto_accept: Optional[Decimal] = None,
     ) -> ListingResult:
         self._ensure_configured()
 
         condition_enum = _map_condition(condition_text)
+        html = description_to_html(description)
 
-        item_payload = {
-            "product": {"title": title[:80], "description": description},
+        product: dict = {"title": title[:80], "description": html}
+        if aspects:
+            product["aspects"] = aspects          # item specifics, e.g. {"Brand": ["Apple"]}
+        if image_urls:
+            product["imageUrls"] = image_urls[:24]
+        item_payload: dict = {
+            "product": product,
             "condition": condition_enum,
             "availability": {"shipToLocationAvailability": {"quantity": quantity}},
         }
+        if condition_description:
+            item_payload["conditionDescription"] = condition_description[:1000]
         resp = await self._request("PUT", f"/sell/inventory/v1/inventory_item/{sku}", json=item_payload)
         if resp.status_code not in (200, 201, 204):
-            raise EbayApiError(f"Failed to create inventory item {sku}: HTTP {resp.status_code}")
+            raise EbayApiError(f"Failed to create inventory item {sku}: HTTP {resp.status_code} {resp.text[:300]}")
 
-        offer_payload = {
+        policies = {
+            "fulfillmentPolicyId": fulfillment_policy_id,
+            "paymentPolicyId": payment_policy_id,
+            "returnPolicyId": return_policy_id,
+        }
+        offer_payload: dict = {
             "sku": sku,
             "marketplaceId": settings.ebay_marketplace_id,
             "format": "FIXED_PRICE",
             "availableQuantity": quantity,
             "categoryId": category_id or "9355",  # default: Cell Phones & Smartphones
-            "listingDescription": description,
+            "listingDescription": html,
             "pricingSummary": {"price": {"value": str(price), "currency": currency}},
-            "listingPolicies": {
-                "fulfillmentPolicyId": None,
-                "paymentPolicyId": None,
-                "returnPolicyId": None,
-            },
+            "listingPolicies": {k: v for k, v in policies.items() if v},
         }
-        # Drop policy keys that are None - the seller's account-level default
-        # policies apply if omitted (business policies are configured once
-        # in the eBay seller account, out of scope for Discord config).
-        offer_payload["listingPolicies"] = {
-            k: v for k, v in offer_payload["listingPolicies"].items() if v
-        }
+        if best_offer_enabled:
+            terms: dict = {"bestOfferEnabled": True}
+            if best_offer_auto_decline:
+                terms["autoDeclinePrice"] = {"value": str(best_offer_auto_decline), "currency": currency}
+            if best_offer_auto_accept:
+                terms["autoAcceptPrice"] = {"value": str(best_offer_auto_accept), "currency": currency}
+            offer_payload["listingPolicies"]["bestOfferTerms"] = terms
+        if merchant_location_key:
+            offer_payload["merchantLocationKey"] = merchant_location_key
 
         resp = await self._request("POST", "/sell/inventory/v1/offer", json=offer_payload)
         if resp.status_code not in (200, 201):
-            raise EbayApiError(f"Failed to create offer for {sku}: HTTP {resp.status_code} {resp.text[:200]}")
+            raise EbayApiError(f"Failed to create offer for {sku}: HTTP {resp.status_code} {resp.text[:300]}")
         offer_id = resp.json()["offerId"]
 
         resp = await self._request("POST", f"/sell/inventory/v1/offer/{offer_id}/publish/")
         if resp.status_code not in (200, 201):
-            raise EbayApiError(f"Failed to publish offer {offer_id}: HTTP {resp.status_code} {resp.text[:200]}")
+            raise EbayApiError(f"Failed to publish offer {offer_id}: HTTP {resp.status_code} {resp.text[:300]}")
         listing_id = resp.json()["listingId"]
 
         url = f"https://www.ebay.co.uk/itm/{listing_id}" if settings.ebay_marketplace_id == "EBAY_GB" \
@@ -258,63 +278,120 @@ class EbayClient(EbayClientInterface):
 
         return ListingResult(listing_id=listing_id, offer_id=offer_id, sku=sku, url=url)
 
-    async def end_listing(self, listing_id: str, reason: str = "NotAvailable") -> None:
+    async def end_listing(self, offer_id: str, reason: str = "NotAvailable") -> None:
         self._ensure_configured()
-        # eBay's withdraw endpoint operates on the *offer*, not the listing
-        # id directly; in this MVP we store offer_id alongside listing_id
-        # on the Listing row and callers should pass that where available.
-        # Best-effort: attempt withdraw by treating listing_id as offer_id
-        # if a dedicated offer id wasn't supplied by the caller.
-        resp = await self._request("POST", f"/sell/inventory/v1/offer/{listing_id}/withdraw")
+        # eBay ends a live listing by withdrawing its OFFER (not the public listing id).
+        resp = await self._request("POST", f"/sell/inventory/v1/offer/{offer_id}/withdraw")
         if resp.status_code not in (200, 204):
-            raise EbayApiError(f"Failed to end listing {listing_id}: HTTP {resp.status_code}")
+            raise EbayApiError(f"Failed to end offer {offer_id}: HTTP {resp.status_code} {resp.text[:300]}")
 
-    async def get_listing_status(self, listing_id: str) -> Optional[str]:
+    async def get_listing_status(self, offer_id: str) -> Optional[str]:
         self._ensure_configured()
-        resp = await self._request("GET", f"/sell/inventory/v1/offer/{listing_id}")
+        resp = await self._request("GET", f"/sell/inventory/v1/offer/{offer_id}")
         if resp.status_code == 404:
             return None
         if resp.status_code != 200:
-            raise EbayApiError(f"Failed to fetch offer {listing_id}: HTTP {resp.status_code}")
+            raise EbayApiError(f"Failed to fetch offer {offer_id}: HTTP {resp.status_code}")
         return resp.json().get("status")
+
+    # ------------------------------------------------------------------
+    # Photos, business policies and stock locations
+    #
+    # NOTE: written from eBay's documentation but not yet exercised against the
+    # live sandbox: check these first when connecting a real account.
+    # ------------------------------------------------------------------
+    async def upload_image(self, data: bytes, filename: str, content_type: str) -> str:
+        """eBay Media API: upload a picture, get back its hosted URL."""
+        self._ensure_configured()
+        base = "https://apim.ebay.com" if settings.ebay_env.upper() == "PRODUCTION" else "https://apim.sandbox.ebay.com"
+        headers = await self._headers()
+        headers.pop("Content-Type", None)  # httpx sets the multipart boundary itself
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(f"{base}/commerce/media/v1_beta/image/create_image_from_file",
+                                     headers=headers, files={"image": (filename, data, content_type)})
+            if resp.status_code not in (200, 201):
+                raise EbayApiError(f"Photo upload failed: HTTP {resp.status_code} {resp.text[:300]}")
+            url = (resp.json() if resp.content else {}).get("imageUrl")
+            if not url and resp.headers.get("Location"):   # otherwise follow the new image resource
+                got = await client.get(resp.headers["Location"], headers=headers)
+                if got.status_code == 200:
+                    url = got.json().get("imageUrl")
+        if not url:
+            raise EbayApiError("eBay accepted the photo but returned no image URL.")
+        return url
+
+    async def _scoped_get(self, path: str, scope: str, **kwargs) -> httpx.Response:
+        """GET with a user token for one extra scope (so an older refresh token that wasn't
+        granted it fails only this call, not every eBay call)."""
+        auth = (settings.ebay_client_id, settings.ebay_client_secret)
+        data = {"grant_type": "refresh_token", "refresh_token": settings.ebay_refresh_token, "scope": scope}
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            tok = await client.post(_auth_url(), data=data, auth=auth)
+        if tok.status_code != 200:
+            raise EbayApiError(
+                "eBay didn't grant account access to read your policies. Re-run scripts/ebay_oauth_setup.py "
+                f"to approve the extra permission (status {tok.status_code}).")
+        headers = {"Authorization": f"Bearer {tok.json()['access_token']}", "Content-Language": "en-GB"}
+        return await self._http.get(path, headers=headers, **kwargs)
+
+    async def get_publishing_setup(self) -> PublishingSetup:
+        self._ensure_configured()
+        scope = "https://api.ebay.com/oauth/api_scope/sell.account.readonly"
+        mp = {"marketplace_id": settings.ebay_marketplace_id}
+        out = PublishingSetup()
+
+        def parse(resp, listkey, idkey) -> list[PolicyInfo]:
+            if resp.status_code != 200:
+                raise EbayApiError(f"Couldn't read eBay {listkey}: HTTP {resp.status_code} {resp.text[:200]}")
+            infos = []
+            for p in resp.json().get(listkey, []):
+                is_default = any(c.get("default") for c in p.get("categoryTypes", []))
+                infos.append(PolicyInfo(id=p[idkey], name=p.get("name", p[idkey]), is_default=is_default))
+            return infos
+
+        out.fulfillment_policies = parse(await self._scoped_get("/sell/account/v1/fulfillment_policy", scope, params=mp),
+                                         "fulfillmentPolicies", "fulfillmentPolicyId")
+        out.payment_policies = parse(await self._scoped_get("/sell/account/v1/payment_policy", scope, params=mp),
+                                     "paymentPolicies", "paymentPolicyId")
+        out.return_policies = parse(await self._scoped_get("/sell/account/v1/return_policy", scope, params=mp),
+                                    "returnPolicies", "returnPolicyId")
+        resp = await self._request("GET", "/sell/inventory/v1/location")
+        if resp.status_code == 200:
+            out.locations = [PolicyInfo(id=l["merchantLocationKey"], name=l.get("name", l["merchantLocationKey"]),
+                                        is_default=False) for l in resp.json().get("locations", [])]
+        return out
+
+    async def create_location(self, key: str, name: str, postcode: str, country: str = "GB") -> None:
+        self._ensure_configured()
+        body = {"name": name, "merchantLocationStatus": "ENABLED", "locationTypes": ["WAREHOUSE"],
+                "location": {"address": {"postalCode": postcode, "country": country}}}
+        resp = await self._request("POST", f"/sell/inventory/v1/location/{key}", json=body)
+        if resp.status_code not in (200, 201, 204):
+            raise EbayApiError(f"Failed to create location {key}: HTTP {resp.status_code} {resp.text[:300]}")
 
     # ------------------------------------------------------------------
     # Orders (Sell Fulfillment API)
     # ------------------------------------------------------------------
     async def get_orders_since(self, since: dt.datetime) -> list[EbayOrder]:
+        """Every order created since `since` (all pages, not just the first 50).
+
+        NOTE: field names follow eBay's Fulfillment API docs; check them against a real
+        order first (the sync falls back to estimated fees if eBay's fee field is missing)."""
         self._ensure_configured()
         since_iso = since.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        params = {"filter": f"creationdate:[{since_iso}..]", "limit": "50"}
-        resp = await self._request("GET", "/sell/fulfillment/v1/order", params=params)
-        if resp.status_code != 200:
-            raise EbayApiError(f"Failed to fetch orders: HTTP {resp.status_code}")
-
         orders: list[EbayOrder] = []
-        for raw in resp.json().get("orders", []):
-            line_items = [
-                EbayOrderLineItem(
-                    sku=li.get("sku", ""),
-                    quantity=int(li.get("quantity", 1)),
-                    line_item_cost=Decimal(str(li.get("lineItemCost", {}).get("value", "0"))),
-                )
-                for li in raw.get("lineItems", [])
-            ]
-            total_fees = Decimal("0")
-            for payment in raw.get("paymentSummary", {}).get("payments", []):
-                for fee in payment.get("marketplaceFees", []) if "marketplaceFees" in payment else []:
-                    total_fees += Decimal(str(fee.get("value", "0")))
-
-            orders.append(
-                EbayOrder(
-                    order_id=raw["orderId"],
-                    line_items=line_items,
-                    total_amount=Decimal(str(raw.get("pricingSummary", {}).get("total", {}).get("value", "0"))),
-                    total_fees=total_fees,
-                    created_at=dt.datetime.fromisoformat(raw["creationDate"].replace("Z", "+00:00")),
-                    buyer_username=raw.get("buyer", {}).get("username"),
-                    fulfillment_status=raw.get("orderFulfillmentStatus"),
-                )
-            )
+        offset, limit = 0, 200
+        for _ in range(50):                       # hard stop: 10,000 orders per sync
+            params = {"filter": f"creationdate:[{since_iso}..]", "limit": str(limit), "offset": str(offset)}
+            resp = await self._request("GET", "/sell/fulfillment/v1/order", params=params)
+            if resp.status_code != 200:
+                raise EbayApiError(f"Failed to fetch orders: HTTP {resp.status_code} {resp.text[:200]}")
+            body = resp.json()
+            page = body.get("orders", [])
+            orders.extend(_parse_order(raw) for raw in page)
+            offset += len(page)
+            if not page or offset >= int(body.get("total", offset)):
+                break
         return orders
 
     # ------------------------------------------------------------------
@@ -371,6 +448,26 @@ class EbayClient(EbayClientInterface):
 
         return _stats_from_prices(prices, source="SOLD")
 
+    async def search_items(self, query: str, *, category_id: Optional[str] = None, max_price: Optional[Decimal] = None,
+                           limit: int = 50, newest_first: bool = True) -> list[EbayItem]:
+        """Live listings matching `query` (Browse API, application token: no seller login needed).
+
+        NOTE: parameter and field names follow eBay's Browse API docs; check one real search first."""
+        self._ensure_buy_apis_configured()
+        filters = ["deliveryCountry:GB" if settings.ebay_marketplace_id == "EBAY_GB" else "deliveryCountry:US"]
+        if max_price is not None:
+            cur = "GBP" if settings.ebay_marketplace_id == "EBAY_GB" else "USD"
+            filters += [f"price:[..{max_price}]", f"priceCurrency:{cur}"]
+        params = {"q": query, "filter": ",".join(filters), "limit": str(min(limit, 200))}
+        if category_id:
+            params["category_ids"] = category_id
+        if newest_first:
+            params["sort"] = "newlyListed"
+        resp = await self._app_request("GET", "/buy/browse/v1/item_summary/search", params=params)
+        if resp.status_code != 200:
+            raise EbayApiError(f"Browse search failed: HTTP {resp.status_code} {resp.text[:200]}")
+        return [i for i in (_parse_item(r) for r in resp.json().get("itemSummaries", [])) if i]
+
     async def get_active_listing_price_stats(self, query: str, condition_ids: list[str]) -> Optional[PriceStats]:
         self._ensure_buy_apis_configured()
         params = {
@@ -394,6 +491,29 @@ class EbayClient(EbayClientInterface):
         return _stats_from_prices(prices, source="ACTIVE_LISTING_ESTIMATE")
 
 
+def _parse_item(raw: dict) -> Optional[EbayItem]:
+    """One Browse API item summary -> EbayItem (None if it has no usable price or link)."""
+    price_node = raw.get("price") or (raw.get("currentBidPrice") if "AUCTION" in raw.get("buyingOptions", []) else None)
+    if not price_node or not raw.get("itemWebUrl"):
+        return None
+    ship = None
+    options = raw.get("shippingOptions") or []
+    if options and options[0].get("shippingCost") is not None:
+        ship = _money(options[0]["shippingCost"])
+    seller = raw.get("seller") or {}
+    fb = seller.get("feedbackPercentage")
+    ends = raw.get("itemEndDate")
+    return EbayItem(
+        item_id=raw["itemId"], title=raw.get("title", ""), price=_money(price_node), url=raw["itemWebUrl"],
+        shipping_cost=ship, condition=raw.get("condition"), condition_id=raw.get("conditionId"),
+        buying_options=list(raw.get("buyingOptions", [])), seller=seller.get("username"),
+        seller_feedback_pct=Decimal(str(fb)) if fb not in (None, "") else None,
+        seller_feedback_score=int(seller["feedbackScore"]) if seller.get("feedbackScore") is not None else None,
+        image_url=(raw.get("image") or {}).get("imageUrl"),
+        ends_at=dt.datetime.fromisoformat(ends.replace("Z", "+00:00")) if ends else None,
+    )
+
+
 def _stats_from_prices(prices: list[Decimal], source: str) -> Optional[PriceStats]:
     if not prices:
         return None
@@ -405,6 +525,67 @@ def _stats_from_prices(prices: list[Decimal], source: str) -> Optional[PriceStat
         min_price=min(prices),
         max_price=max(prices),
     )
+
+
+def _money(node) -> Decimal:
+    try:
+        return Decimal(str((node or {}).get("value", "0")))
+    except Exception:
+        return Decimal("0")
+
+
+def _parse_order(raw: dict) -> EbayOrder:
+    line_items = [
+        EbayOrderLineItem(sku=li.get("sku", ""), quantity=int(li.get("quantity", 1)),
+                          line_item_cost=_money(li.get("lineItemCost")))
+        for li in raw.get("lineItems", [])
+    ]
+    # eBay reports the order's selling fees as totalMarketplaceFee. Older code looked inside the
+    # payments instead, so keep that as a fallback. 0 means "eBay didn't tell us".
+    fees = _money(raw.get("totalMarketplaceFee"))
+    if fees == 0:
+        for payment in raw.get("paymentSummary", {}).get("payments", []):
+            for fee in payment.get("marketplaceFees", []):
+                fees += _money(fee)
+    pricing = raw.get("pricingSummary", {})
+    return EbayOrder(
+        order_id=raw["orderId"], line_items=line_items, total_amount=_money(pricing.get("total")),
+        total_fees=fees, created_at=dt.datetime.fromisoformat(raw["creationDate"].replace("Z", "+00:00")),
+        buyer_username=raw.get("buyer", {}).get("username"), fulfillment_status=raw.get("orderFulfillmentStatus"),
+        delivery_cost=_money(pricing.get("deliveryCost")), payment_status=raw.get("orderPaymentStatus"),
+        cancel_state=(raw.get("cancelStatus") or {}).get("cancelState"),
+    )
+
+
+def description_to_html(text: str) -> str:
+    """Our descriptions are plain text; eBay shows the description as HTML, where bare line
+    breaks vanish. Blank lines become paragraphs, runs of '• ' lines become bullet lists, and
+    a line wholly in CAPITALS becomes a heading."""
+    import html as _html
+    out, bullets = [], []
+
+    def flush() -> None:
+        if bullets:
+            out.append("<ul>" + "".join(f"<li>{b}</li>" for b in bullets) + "</ul>")
+            bullets.clear()
+
+    for block in (text or "").replace("\r\n", "\n").split("\n\n"):
+        for line in block.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            esc = _html.escape(line)
+            if line.startswith("• "):
+                bullets.append(_html.escape(line[2:].strip()))
+                continue
+            flush()
+            if line.isupper() and len(line) < 40:
+                out.append(f"<h3>{esc}</h3>")
+            else:
+                out.append(f"<p>{esc}</p>")
+        flush()
+    flush()
+    return "".join(out)
 
 
 def _map_condition(condition_text: str) -> str:

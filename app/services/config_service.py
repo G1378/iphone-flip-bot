@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import difflib
+import re
 from decimal import Decimal
 from typing import Optional, Sequence
 
@@ -42,6 +44,8 @@ async def seed_defaults_if_empty(session: AsyncSession) -> None:
                         sort_order=i, is_terminal=terminal,
                     )
                 )
+
+    await ensure_default_phone_models(session)
 
     # Part types first: default tests point at them (test -> fixing part).
     if not (await session.execute(select(PartTypeConfig.id).limit(1))).first():
@@ -289,8 +293,83 @@ async def list_locations(session: AsyncSession) -> Sequence[Location]:
 # ----------------------------------------------------------------------
 # Phone models / part types / test definitions / condition grades / expense categories
 # ----------------------------------------------------------------------
+class UnknownPhoneModelError(ValueError):
+    """The text doesn't match exactly one model in the catalog."""
+
+    def __init__(self, text: str, suggestions: Sequence[str] = (), inactive: bool = False):
+        self.text, self.suggestions, self.inactive = text, list(suggestions), inactive
+        if inactive:
+            msg = f"'{text}' is in the model catalog but switched off."
+        else:
+            msg = f"'{text}' isn't a model in the catalog."
+        if self.suggestions:
+            msg += " Did you mean: " + ", ".join(self.suggestions) + "?"
+        msg += " Models must match exactly (a base model, Pro and Pro Max take different parts)."
+        super().__init__(msg)
+
+
+def model_key(text: Optional[str]) -> str:
+    """Comparison key: case, spaces and punctuation ignored, leading 'Apple'/'iPhone' dropped.
+    '13 Pro' == 'iPhone 13 pro' but '13' != '13 Pro' and '13 Pro' != '13 Pro Max'."""
+    k = re.sub(r"[^a-z0-9]", "", (text or "").lower())
+    for prefix in ("apple", "iphone"):
+        if k.startswith(prefix):
+            k = k[len(prefix):]
+    return k
+
+
+def canonical_model_name(text: str) -> str:
+    """Tidy a new model name for the catalog: 'iphone 13 pro' / '13 pro' -> 'iPhone 13 Pro'."""
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if not t:
+        return t
+    if not re.match(r"(?i)^iphone\b", t):
+        t = "iPhone " + t
+    words = t.split(" ")
+    out = ["iPhone"]
+    for w in words[1:]:
+        lw = w.lower()
+        out.append(lw.capitalize() if lw in {"pro", "max", "plus", "air"} else ("mini" if lw == "mini" else (w.upper() if lw in {"xr", "xs", "se", "x"} else w)))
+    return " ".join(out)
+
+
+async def ensure_default_phone_models(session: AsyncSession) -> None:
+    """Add any default model missing from the catalog. Idempotent; never touches
+    existing rows (so a model an admin switched off stays off)."""
+    existing = {model_key(m.model + (m.variant or "")) for m in
+                (await session.execute(select(PhoneModelConfig))).scalars().all()}
+    for name in d.DEFAULT_PHONE_MODELS:
+        if model_key(name) not in existing:
+            session.add(PhoneModelConfig(manufacturer="Apple", model=name))
+            existing.add(model_key(name))
+    await session.flush()
+
+
+async def resolve_phone_model(session: AsyncSession, text: str, variant: Optional[str] = None) -> PhoneModelConfig:
+    """The ONE catalog model this text names, or UnknownPhoneModelError.
+
+    Used everywhere a person types a model (buying phones/donors, ordering parts,
+    pricing, finding parts). Never creates anything: new models are added on
+    purpose with `/config phone-models add`."""
+    key = model_key(f"{text}{variant or ''}")
+    rows = (await session.execute(select(PhoneModelConfig))).scalars().all()
+    hits = [m for m in rows if model_key(m.model + (m.variant or "")) == key and key]
+    active = [m for m in hits if m.active]
+    if len(active) == 1:
+        return active[0]
+    if hits and not active:
+        raise UnknownPhoneModelError(text, inactive=True)
+    names = {m.display_name(): model_key(m.model + (m.variant or "")) for m in rows if m.active}
+    close = [n for n, k in names.items() if key and (k.startswith(key) or key.startswith(k) or key in k)]
+    close += [n for n in difflib.get_close_matches(text, list(names), n=4, cutoff=0.6) if n not in close]
+    raise UnknownPhoneModelError(text, [c.replace("Apple ", "", 1) for c in close[:6]])
+
+
 async def get_or_create_phone_model(session: AsyncSession, manufacturer: str, model: str,
                                      variant: Optional[str] = None) -> PhoneModelConfig:
+    """Add-or-find a catalog model. Only for deliberately adding models (admin
+    `/config phone-models add`, demo seed). Day-to-day code uses resolve_phone_model."""
+    model = canonical_model_name(model) if manufacturer == "Apple" else model
     stmt = select(PhoneModelConfig).where(
         PhoneModelConfig.manufacturer == manufacturer,
         PhoneModelConfig.model == model,
@@ -303,6 +382,19 @@ async def get_or_create_phone_model(session: AsyncSession, manufacturer: str, mo
     session.add(row)
     await session.flush()
     return row
+
+
+async def phone_model_for(session: AsyncSession, holder) -> PhoneModelConfig:
+    """The catalog model of a Phone or Donor. Falls back to resolving its text
+    (older rows have no phone_model_id) and records the link."""
+    if holder.phone_model_id is not None:
+        m = await session.get(PhoneModelConfig, holder.phone_model_id)
+        if m is not None:
+            return m
+    m = await resolve_phone_model(session, holder.model, holder.variant)
+    holder.phone_model_id = m.id
+    await session.flush()
+    return m
 
 
 async def list_phone_models(session: AsyncSession) -> Sequence[PhoneModelConfig]:
@@ -383,6 +475,25 @@ async def list_expense_categories(session: AsyncSession) -> Sequence[ExpenseCate
     return (
         await session.execute(select(ExpenseCategory).where(ExpenseCategory.active.is_(True)).order_by(ExpenseCategory.name))
     ).scalars().all()
+
+
+async def pricing_thresholds(session: AsyncSession, phone_model_id: Optional[int]) -> tuple[Decimal, Decimal, Decimal]:
+    """(min profit £, min ROI %, target margin %) for a model.
+
+    A rule made for that specific model wins, field by field. Otherwise the business settings
+    (`/config business`) apply. The seeded global rule row is deliberately NOT consulted: it
+    held a copy of the defaults that silently overrode any change made to the settings."""
+    rule = None
+    if phone_model_id is not None:
+        rule = (await session.execute(select(PricingRule).where(
+            PricingRule.phone_model_id == phone_model_id, PricingRule.active.is_(True)))).scalar_one_or_none()
+
+    async def pick(value, key: str, default: str) -> Decimal:
+        return value if value is not None else await get_setting_decimal(session, key, Decimal(default))
+
+    return (await pick(rule.min_profit_gbp if rule else None, "min_profit_gbp", "20.00"),
+            await pick(rule.min_roi_pct if rule else None, "min_roi_pct", "15.00"),
+            await pick(rule.target_margin_pct if rule else None, "target_margin_pct", "25.00"))
 
 
 async def get_pricing_rule(session: AsyncSession, phone_model_id: Optional[int]) -> Optional[PricingRule]:

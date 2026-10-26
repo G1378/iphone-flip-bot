@@ -166,7 +166,8 @@ async def test_a_part_arriving_edits_the_same_message(world, actor_id):
     from app.services import parts as parts_service
     async with scope() as s:
         await parts_service.create_part(s, parts_service.CreatePartInput(
-            part_type_name="Screen", source_type=PartSourceType.EXISTING_STOCK, cost=Decimal("30")), actor_id)
+            part_type_name="Screen", source_type=PartSourceType.EXISTING_STOCK, cost=Decimal("30"),
+            compatible_model_ids=[(await config_service.resolve_phone_model(s, "iPhone 13")).id]), actor_id)
     await cog.engine_tick()
     assert channel.live == [msg], "same message, not a new one"
     assert msg.embed.title.startswith("🔧 Swap parts") and channel.edits == 1

@@ -9,7 +9,7 @@ from app.integrations.ebay.interface import EbayNotConfiguredError
 from app.integrations.ebay.mock import MockEbayClient
 from app.jobs.ebay_sync_job import sync_ebay_orders
 from app.models.enums import AcquisitionType
-from app.services import finance, listings, phones
+from app.services import config_service, finance, listing_builder, listings, phones
 
 
 async def _make_listed_phone(session, actor_id, today, ebay_sku_will_match=True):
@@ -21,9 +21,13 @@ async def _make_listed_phone(session, actor_id, today, ebay_sku_will_match=True)
     )
     phone = await phones.buy_phone(session, data, actor_id)
 
+    phone.photo_urls = ["https://mock.ebay.local/img/1.jpg"]
+    for key in ("ebay_fulfillment_policy_id", "ebay_payment_policy_id", "ebay_return_policy_id",
+                "ebay_merchant_location_key"):
+        await config_service.set_setting(session, key, "x")
     draft = listings.DraftListingInput(
         title="iPhone 12 64GB Black - Unlocked - Excellent", description="Tested and working.",
-        condition_text="Excellent", price=Decimal("280.00"),
+        condition_text="Excellent", price=Decimal("280.00"), aspects=listing_builder.build_aspects(phone),
     )
     listing = await listings.create_draft(session, phone, draft, actor_id)
     return phone, listing

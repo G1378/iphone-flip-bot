@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, ROUND_UP
 from typing import Optional, Sequence
 
 from sqlalchemy import func, select
@@ -99,12 +99,35 @@ class EconomicAnalysis:
     target_margin_threshold: Decimal
 
 
+async def minimum_sale_price(session: AsyncSession, phone: Phone) -> Decimal:
+    """The lowest asking price (rounded UP to a whole pound) at which /analyse would still
+    call this phone GOOD: it clears the minimum profit AND the minimum ROI, after eBay fees,
+    postage and packaging. Uses exactly the same settings and per-model overrides as
+    analyse_phone, so the two can never disagree."""
+    breakdown = await compute_true_cost(session, phone)
+    phone_model = await config_service.phone_model_for(session, phone)
+    rule = await config_service.get_pricing_rule(session, phone_model.id)
+
+    fee_pct = await config_service.get_setting_decimal(session, "ebay_fee_pct_assumption", Decimal("12.8"))
+    fee_fixed = await config_service.get_setting_decimal(session, "ebay_fixed_fee_assumption", Decimal("0.30"))
+    postage = await config_service.get_setting_decimal(session, "default_postage_cost", Decimal("2.98"))
+    packaging = await config_service.get_setting_decimal(session, "default_packaging_cost", Decimal("1.00"))
+    min_profit, min_roi, _ = await config_service.pricing_thresholds(session, phone_model.id)
+
+    cost = breakdown.total
+    keep = Decimal("1") - fee_pct / Decimal("100")          # share of the price left after the % fee
+    overheads = fee_fixed + postage + packaging
+    by_profit = (cost + overheads + min_profit) / keep
+    by_roi = (cost * (Decimal("1") + min_roi / Decimal("100")) + overheads) / keep
+    return max(by_profit, by_roi).to_integral_value(rounding=ROUND_UP)
+
+
 async def analyse_phone(
     session: AsyncSession, phone: Phone, expected_sale_price: Optional[Decimal] = None,
 ) -> EconomicAnalysis:
     breakdown = await compute_true_cost(session, phone)
 
-    phone_model = await config_service.get_or_create_phone_model(session, phone.manufacturer, phone.model, phone.variant)
+    phone_model = await config_service.phone_model_for(session, phone)
     rule = await config_service.get_pricing_rule(session, phone_model.id)
 
     if expected_sale_price is None:
@@ -116,15 +139,10 @@ async def analyse_phone(
 
     fee_pct = await config_service.get_setting_decimal(session, "ebay_fee_pct_assumption", Decimal("12.8"))
     fee_fixed = await config_service.get_setting_decimal(session, "ebay_fixed_fee_assumption", Decimal("0.30"))
-    default_postage = await config_service.get_setting_decimal(session, "default_postage_cost", Decimal("6.00"))
+    default_postage = await config_service.get_setting_decimal(session, "default_postage_cost", Decimal("2.98"))
     default_packaging = await config_service.get_setting_decimal(session, "default_packaging_cost", Decimal("1.00"))
 
-    min_profit = (rule.min_profit_gbp if rule and rule.min_profit_gbp is not None else None) \
-        or await config_service.get_setting_decimal(session, "min_profit_gbp", Decimal("20.00"))
-    min_roi = (rule.min_roi_pct if rule and rule.min_roi_pct is not None else None) \
-        or await config_service.get_setting_decimal(session, "min_roi_pct", Decimal("15.00"))
-    target_margin = (rule.target_margin_pct if rule and rule.target_margin_pct is not None else None) \
-        or await config_service.get_setting_decimal(session, "target_margin_pct", Decimal("25.00"))
+    min_profit, min_roi, target_margin = await config_service.pricing_thresholds(session, phone_model.id)
 
     estimated_ebay_fees = q(expected_sale_price * (fee_pct / Decimal("100")) + fee_fixed)
     total_cost = breakdown.total
@@ -181,7 +199,7 @@ async def record_sale(
             return existing
 
     if postage_cost is None:
-        postage_cost = await config_service.get_setting_decimal(session, "default_postage_cost", Decimal("6.00"))
+        postage_cost = await config_service.get_setting_decimal(session, "default_postage_cost", Decimal("2.98"))
     if packaging_cost is None:
         packaging_cost = await config_service.get_setting_decimal(session, "default_packaging_cost", Decimal("1.00"))
 

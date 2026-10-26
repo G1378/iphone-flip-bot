@@ -10,7 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.enums import AcquisitionType, InventoryEventType
-from app.models.inventory_models import Phone, PhoneFault
+from app.models.inventory_models import Part, Phone, PhoneFault
+from app.models.repair_models import Repair
 from app.services import config_service
 from app.services.events import log_event
 from app.services.ids import next_internal_id
@@ -39,7 +40,9 @@ class BuyPhoneInput:
 
 
 async def buy_phone(session: AsyncSession, data: BuyPhoneInput, actor_discord_id: int) -> Phone:
-    await config_service.get_or_create_phone_model(session, data.manufacturer, data.model, data.variant)
+    # Must be exactly one model in the catalog ("iPhone 13" vs "iPhone 13 Pro" vs "13 Pro Max"):
+    # parts are matched to the phone through it. Raises UnknownPhoneModelError otherwise.
+    catalog = await config_service.resolve_phone_model(session, data.model, data.variant)
 
     location = None
     if data.location_code:
@@ -48,9 +51,10 @@ async def buy_phone(session: AsyncSession, data: BuyPhoneInput, actor_discord_id
     internal_id = await next_internal_id(session, "phone")
     phone = Phone(
         internal_id=internal_id,
-        manufacturer=data.manufacturer,
-        model=data.model,
-        variant=data.variant,
+        manufacturer=catalog.manufacturer,
+        model=catalog.model,
+        variant=catalog.variant,
+        phone_model_id=catalog.id,
         storage=data.storage,
         colour=data.colour,
         imei=data.imei,
@@ -136,7 +140,41 @@ async def move_phone(session: AsyncSession, phone: Phone, location_code: str, ac
     return phone
 
 
+class PhoneModelChangeError(ValueError):
+    pass
+
+
+async def change_phone_model(session: AsyncSession, phone: Phone, model_text: str, actor_discord_id: int) -> Phone:
+    """Correct a phone's model (e.g. it was bought/entered as the wrong one).
+
+    Blocked while parts are reserved for it or fitted in it, because those were
+    matched to the old model: remove/unreserve them first. Open repair lines
+    simply re-match against the new model's stock."""
+    new = await config_service.resolve_phone_model(session, model_text)
+    old = await config_service.phone_model_for(session, phone)
+    if new.id == old.id:
+        return phone
+    stmt = select(Part).where(or_(Part.installed_phone_id == phone.id, Part.reserved_for_repair_id.in_(
+        select(Repair.id).where(Repair.phone_id == phone.id))), Part.status.in_(("RESERVED", "INSTALLED")))
+    in_use = (await session.execute(stmt)).scalars().all()
+    if in_use:
+        ids = ", ".join(p.internal_id for p in in_use)
+        raise PhoneModelChangeError(
+            f"{phone.internal_id} has parts reserved or fitted ({ids}) that were matched to {old.model}. "
+            f"Remove or unreserve them before changing the model to {new.model}.")
+    phone.manufacturer, phone.model, phone.variant, phone.phone_model_id = new.manufacturer, new.model, new.variant, new.id
+    await session.flush()
+    await log_event(
+        session, event_type=InventoryEventType.PHONE_UPDATED.value, entity_type="PHONE",
+        entity_id=phone.internal_id, actor_discord_id=actor_discord_id,
+        previous_state={"model": old.model}, new_state={"model": new.model},
+    )
+    return phone
+
+
 async def edit_phone(session: AsyncSession, phone: Phone, actor_discord_id: int, **fields) -> Phone:
+    if {"model", "variant", "manufacturer", "phone_model_id"} & set(fields):
+        raise ValueError("Use change_phone_model() to change a phone's model.")
     before = {k: str(getattr(phone, k)) for k in fields}
     for k, v in fields.items():
         setattr(phone, k, v)
@@ -203,3 +241,20 @@ async def search_phones(session: AsyncSession, term: str) -> Sequence[Phone]:
         .limit(25)
     )
     return (await session.execute(stmt)).scalars().all()
+
+
+MAX_PHOTOS = 24  # eBay's limit per listing
+
+
+async def add_photos(session: AsyncSession, phone: Phone, urls: list[str], actor_discord_id: int,
+                     replace: bool = False) -> Phone:
+    """Record eBay-hosted photo URLs for a phone, in order (first = main image)."""
+    current = [] if replace else list(phone.photo_urls or [])
+    phone.photo_urls = (current + list(urls))[:MAX_PHOTOS]   # new list: JSON columns aren't change-tracked in place
+    await session.flush()
+    await log_event(
+        session, event_type=InventoryEventType.PHONE_UPDATED.value, entity_type="PHONE",
+        entity_id=phone.internal_id, actor_discord_id=actor_discord_id,
+        new_state={"photos": len(phone.photo_urls)}, notes="photos added" if not replace else "photos replaced",
+    )
+    return phone

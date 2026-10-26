@@ -178,7 +178,7 @@ async def test_recommendation_uses_historical_repair_cost_when_available(session
     rp = repair.parts[0]
     part_data = parts_service.CreatePartInput(
         part_type_name="Screen", source_type=PartSourceType.PURCHASED, cost=Decimal("45.00"),
-        testing_status=TestOutcome.PASS,
+        testing_status=TestOutcome.PASS, compatible_model_ids=[(await config_service.resolve_phone_model(session, "iPhone 13 Pro")).id],
     )
     part = await parts_service.create_part(session, part_data, actor_id)
     await parts_service.reserve_part(session, part, repair, rp, actor_id)

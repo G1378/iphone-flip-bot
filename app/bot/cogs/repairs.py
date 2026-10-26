@@ -116,7 +116,7 @@ class RepairsCog(commands.Cog):
                 await interaction.response.send_message(embed=error_embed(f"No phone found with ID `{internal_id}`."), ephemeral=True)
                 return
             repair = await repairs_service.create_repair_for_open_faults(session, phone, interaction.user.id)
-            phone_model = await config_service.get_or_create_phone_model(session, phone.manufacturer, phone.model, phone.variant)
+            phone_model = await config_service.phone_model_for(session, phone)
             plan = await repairs_service.repair_plan(session, repair, phone_model.id)
             embed = repair_plan_embed(phone, plan)
             embed.set_footer(text=f"Repair ID: {repair.internal_id}")

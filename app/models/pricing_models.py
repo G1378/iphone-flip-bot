@@ -54,3 +54,28 @@ class PriceObservation(Base, TimestampMixin):
     observed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
 
     phone_model: Mapped["PhoneModelConfig"] = relationship(lazy="selectin")
+
+
+class DealAlert(Base, TimestampMixin):
+    """An eBay listing the deal scanner told you about. One row per eBay item, so the same
+    listing is never announced twice."""
+
+    __tablename__ = "deal_alerts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ebay_item_id: Mapped[str] = mapped_column(String(60), unique=True, index=True, nullable=False)
+    phone_model_id: Mapped[int] = mapped_column(ForeignKey("phone_models.id"), nullable=False)
+    storage: Mapped[Optional[str]] = mapped_column(String(20))
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    bucket: Mapped[str] = mapped_column(String(20), nullable=False)          # USED | FAULTY
+    price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)    # item price when announced
+    postage: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)  # postage (or the assumed amount)
+    max_buy: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)  # your recommended maximum, all in
+    url: Mapped[str] = mapped_column(String(500), nullable=False)
+    seller: Mapped[Optional[str]] = mapped_column(String(100))
+    seller_feedback_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 1))
+    is_auction: Mapped[bool] = mapped_column(default=False)
+    ends_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    flags: Mapped[Optional[str]] = mapped_column(String(300))                # e.g. "iCloud/lock risk"
+
+    phone_model: Mapped["PhoneModelConfig"] = relationship(lazy="selectin")

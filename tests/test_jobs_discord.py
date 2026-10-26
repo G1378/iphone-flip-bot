@@ -375,7 +375,7 @@ async def test_ordering_a_missing_part_from_the_channel(world):
     inter = _in_channel(w, ch)
     await w.jobs.handle(inter, "order", _act_ref(panel.buttons(), "order"))
     form = inter.response.modals[0]
-    assert form.title == "Order Screen"
+    assert form.title == "Order Screen (iPhone 13)"
     form.supplier._value, form.cost._value, form.expected._value = "ScreenCo", "35.50", "2026-11-02"
     submit = _in_channel(w, ch)
     await form.on_submit(submit)
@@ -604,10 +604,11 @@ async def test_a_second_failed_part_says_probably_not_the_part(world):
 
 async def _stock_in(session, actor):
     from app.models.enums import PartSourceType
-    from app.services import parts as parts_service
+    from app.services import config_service, parts as parts_service
     from decimal import Decimal
     await parts_service.create_part(session, parts_service.CreatePartInput(
-        part_type_name="Screen", source_type=PartSourceType.EXISTING_STOCK, cost=Decimal("30")), actor)
+        part_type_name="Screen", source_type=PartSourceType.EXISTING_STOCK, cost=Decimal("30"),
+        compatible_model_ids=[(await config_service.resolve_phone_model(session, "iPhone 13")).id]), actor)
 
 
 async def test_removing_a_fitted_part_asks_why_and_a_failure_is_written_off(world):
