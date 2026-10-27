@@ -45,9 +45,11 @@ class WalkthroughView(discord.ui.View):
 
     def __init__(self, invoker_id: int, phone_internal_id: str, phone_title: str,
                  steps: list[Step], start_status: str,
-                 on_finish: Optional[Callable[[], Awaitable[None]]] = None, record_condition: bool = True):
+                 on_finish: Optional[Callable[[], Awaitable[None]]] = None, record_condition: bool = True,
+                 battery_retest: bool = False):
         super().__init__(timeout=900)
         self.record_condition = record_condition  # False for a re-test of failed tests only
+        self.battery_retest = battery_retest      # a re-test that includes the battery: ask for the % again
         self.on_finish = on_finish  # e.g. a job channel redrawing its panel
         self.invoker_id = invoker_id
         self.phone_internal_id = phone_internal_id
@@ -144,6 +146,8 @@ class WalkthroughView(discord.ui.View):
         async with session_scope() as session:
             phone = await phones_service.get_phone(session, self.phone_internal_id)
             stages = condition_stages(phone, full=self.record_condition) if phone else []
+            if self.battery_retest and phone and "battery" not in stages:
+                stages.append("battery")
         if stages:
             view = ConditionView(self.invoker_id, self.phone_internal_id, self.phone_title, stages, self._summary_and_hook)
             view.message = self.message
@@ -284,6 +288,7 @@ class ConditionView(discord.ui.View):
         self.stages, self.done = stages, done
         self.index = 0
         self.notes: list[str] = []
+        self.low: Optional[int] = None      # a battery % under the minimum, waiting for override / continue
         self.message: Optional[discord.Message] = None
         self._lock = asyncio.Lock()
         self._build_buttons()
@@ -294,6 +299,14 @@ class ConditionView(discord.ui.View):
 
     def _build_buttons(self) -> None:
         self.clear_items()
+        if self.low is not None:
+            keep = discord.ui.Button(label="Override: keep battery", style=discord.ButtonStyle.primary, emoji="🔋")
+            keep.callback = self._override_low
+            cont = discord.ui.Button(label=f"Continue: order battery", style=discord.ButtonStyle.danger, emoji="❌")
+            cont.callback = self._accept_low
+            self.add_item(keep)
+            self.add_item(cont)
+            return
         if self.stage == "battery":
             na = discord.ui.Button(label="Not applicable", style=discord.ButtonStyle.secondary, emoji="➖")
             na.callback = lambda i: self.record_battery(i, not_applicable=True)
@@ -312,9 +325,15 @@ class ConditionView(discord.ui.View):
         what = {"frame": "Frame", "back glass": "Back glass", "battery": "Battery health"}[self.stage]
         e = discord.Embed(title=f"📱 Condition - {self.phone_title}", colour=discord.Colour.blue(),
                           description=f"## {what}\nStep **{self.index + 1}** of **{len(self.stages)}**")
-        if self.stage == "battery":
-            e.add_field(name="Record", value="The % from Settings > Battery > Battery Health. If the phone doesn't show "
-                                             "one (e.g. a non-genuine battery) press **Not applicable**.", inline=False)
+        if self.low is not None:
+            e.add_field(name=f"⚠️ {self.low}% is under {cosmetics.BATTERY_MIN_HEALTH}%",
+                        value="That counts as a **failed battery test**: a Battery is needed (ordered if you have none in stock). "
+                              "Press **Override** to keep this battery instead.", inline=False)
+        elif self.stage == "battery":
+            e.add_field(name="Record", value="The % from Settings > Battery > Battery Health. "
+                                             f"Under **{cosmetics.BATTERY_MIN_HEALTH}%** fails the battery test (a Battery is needed); "
+                                             "you can override that on the next screen. If the phone doesn't show a % "
+                                             "(e.g. a non-genuine battery) press **Not applicable**.", inline=False)
         else:
             e.add_field(name="Grades", value="\n".join(f"**{g}** {cosmetics.GRADE_DESCRIPTIONS[g]}" for g in cosmetics.GRADES), inline=False)
             e.add_field(name="What happens", value="**D** must be replaced before sale (added to the repair). "
@@ -359,11 +378,33 @@ class ConditionView(discord.ui.View):
             async with session_scope() as session:
                 phone = await phones_service.get_phone(session, self.phone_internal_id)
                 try:
-                    await cosmetics.set_battery(session, phone, interaction.user.id, percent=percent, not_applicable=not_applicable)
+                    out = await testing_service.apply_battery_health(
+                        session, phone, interaction.user.id, percent=percent, not_applicable=not_applicable)
                 except cosmetics.CosmeticError as e:
                     await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
                     return
+            if out.failed:   # under the minimum: let them override before moving on
+                self.low = percent
+                self._build_buttons()
+                await interaction.response.edit_message(embed=self.embed(), view=self)
+                return
             self.notes.append("✅ Battery health " + ("not applicable" if not_applicable else f"**{percent}%**"))
+            await self._next(interaction)
+
+    async def _override_low(self, interaction: discord.Interaction) -> None:
+        async with self._lock:
+            pct = self.low
+            async with session_scope() as session:
+                phone = await phones_service.get_phone(session, self.phone_internal_id)
+                await testing_service.apply_battery_health(session, phone, interaction.user.id, percent=pct, override=True)
+            self.low = None
+            self.notes.append(f"✅ Battery health **{pct}%** - under {cosmetics.BATTERY_MIN_HEALTH}% but **overridden**, battery kept")
+            await self._next(interaction)
+
+    async def _accept_low(self, interaction: discord.Interaction) -> None:
+        async with self._lock:
+            pct, self.low = self.low, None
+            self.notes.append(f"❌ Battery health **{pct}%** - under {cosmetics.BATTERY_MIN_HEALTH}%: **Battery needed**")
             await self._next(interaction)
 
     async def on_timeout(self) -> None:
@@ -396,6 +437,10 @@ async def begin_walkthrough(interaction: discord.Interaction, internal_id: str, 
         await interaction.response.send_message(embed=error_embed("No test checklist items configured. Ask an admin to run `/config tests add`."), ephemeral=True)
         return
 
+    # The battery has no PASS/FAIL question of its own: the detailed battery health step (under 80% = fail,
+    # with an override button) records that test's result.
+    battery_retest = any(d.code == testing_service.BATTERY_TEST_CODE for d, _ in summary)
+    summary = [(d, r) for d, r in summary if d.code != testing_service.BATTERY_TEST_CODE]
     steps = [
         Step(
             test_definition_id=d.id,
@@ -406,7 +451,12 @@ async def begin_walkthrough(interaction: discord.Interaction, internal_id: str, 
         for d, r in summary
     ]
     view = WalkthroughView(interaction.user.id, internal_id.upper(), title, steps, start_status, on_finish=on_finish,
-                           record_condition=only_definition_ids is None)
+                           record_condition=only_definition_ids is None, battery_retest=battery_retest)
+    if not steps:   # only the battery was asked for (e.g. a job channel re-test of a failed battery)
+        cview = ConditionView(interaction.user.id, internal_id.upper(), title, ["battery"], view._summary_and_hook)
+        await interaction.response.send_message(embed=cview.embed(), view=cview)
+        cview.message = await interaction.original_response()
+        return
     await interaction.response.send_message(embed=view.step_embed(), view=view)
     view.message = await interaction.original_response()
 
@@ -469,7 +519,8 @@ class TestingCog(commands.Cog):
     @app_commands.command(name="condition", description="Record frame / back glass grade and battery health for a phone")
     @app_commands.describe(
         frame="Frame (housing) grade", back_glass="Back glass grade", battery="Battery health % (leave blank if unchanged)",
-        battery_not_applicable="Phone shows no battery health (e.g. non-genuine battery)")
+        battery_not_applicable="Phone shows no battery health (e.g. non-genuine battery)",
+        battery_override="Keep the battery even though it is under 80% (otherwise a Battery is needed)")
     @app_commands.choices(
         frame=[app_commands.Choice(name=f"{g} - {cosmetics.GRADE_DESCRIPTIONS[g]}"[:100], value=g) for g in cosmetics.GRADES],
         back_glass=[app_commands.Choice(name=f"{g} - {cosmetics.GRADE_DESCRIPTIONS[g]}"[:100], value=g) for g in cosmetics.GRADES])
@@ -477,7 +528,8 @@ class TestingCog(commands.Cog):
     async def condition(self, interaction: discord.Interaction, internal_id: str,
                         frame: Optional[app_commands.Choice[str]] = None,
                         back_glass: Optional[app_commands.Choice[str]] = None,
-                        battery: Optional[int] = None, battery_not_applicable: bool = False):
+                        battery: Optional[int] = None, battery_not_applicable: bool = False,
+                        battery_override: bool = False):
         lines: list[str] = []
         async with session_scope() as session:
             phone = await phones_service.get_phone(session, internal_id)
@@ -489,8 +541,15 @@ class TestingCog(commands.Cog):
                     if choice is not None:
                         lines.append("• " + (await cosmetics.set_grade(session, phone, role, choice.value, interaction.user.id)).summary())
                 if battery is not None or battery_not_applicable:
-                    await cosmetics.set_battery(session, phone, interaction.user.id, percent=battery, not_applicable=battery_not_applicable)
-                    lines.append("• Battery health " + ("not applicable" if battery_not_applicable else f"**{battery}%**"))
+                    b = await testing_service.apply_battery_health(
+                        session, phone, interaction.user.id, percent=battery, not_applicable=battery_not_applicable,
+                        override=battery_override)
+                    text = "not applicable" if battery_not_applicable else f"**{battery}%**"
+                    if b.failed:
+                        text += f" - under {cosmetics.BATTERY_MIN_HEALTH}%: **Battery needed** (use `battery_override` to keep it)"
+                    elif b.overridden:
+                        text += f" - under {cosmetics.BATTERY_MIN_HEALTH}% but overridden, battery kept"
+                    lines.append("• Battery health " + text)
             except cosmetics.CosmeticError as e:
                 await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
                 return

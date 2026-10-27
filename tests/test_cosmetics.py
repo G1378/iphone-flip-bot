@@ -92,7 +92,7 @@ async def test_regrading_a_d_up_clears_the_fault_and_the_repair(session, actor_i
     assert out.fault_cleared
     assert (await session.execute(select(PhoneFault))).scalars().one().status == FaultStatus.RESOLVED
     assert await repairs_service.get_active_repair(session, phone) is None
-    assert phone.current_status == "TESTED"
+    assert phone.current_status == "AWAITING_TEST"   # tests aren't all done, so it isn't "tested"
 
 
 async def test_a_d_listing_is_blocked_until_replaced(session, actor_id):
@@ -310,3 +310,72 @@ async def test_listing_with_battery_not_applicable_says_so_and_does_not_nag(sess
     assert "Battery health: not shown by this phone" in built.description
     assert not any("battery" in w.lower() for w in built.warnings)
     assert any("Frame hasn't been graded" in w for w in built.warnings)
+
+
+# ------------------------------------------------------------------ battery % drives the battery test (under 80% fails)
+async def _battery_fault(session):
+    return [f for f in (await session.execute(select(PhoneFault))).scalars().all() if f.status == FaultStatus.OPEN]
+
+
+async def test_battery_under_80_fails_the_battery_test_and_a_battery_is_needed(session, actor_id):
+    phone = await _buy(session, actor_id)
+    out = await testing_service.apply_battery_health(session, phone, actor_id, percent=79)
+    assert out.failed and out.below_minimum and not out.overridden
+    assert phone.battery_health == 79 and phone.current_status == "REPAIR_REQUIRED"
+    repair = await repairs_service.get_active_repair(session, phone)
+    assert [rp.required_part_type.name for rp in repair.parts] == ["Battery"]
+    t = await _ticket(session, phone)
+    assert t.stage == "REPAIR" and "needs ordering" in t.description
+
+
+async def test_battery_at_80_or_over_passes(session, actor_id):
+    phone = await _buy(session, actor_id)
+    out = await testing_service.apply_battery_health(session, phone, actor_id, percent=80)
+    assert not out.failed and not out.below_minimum
+    assert await repairs_service.get_active_repair(session, phone) is None and not await _battery_fault(session)
+
+
+async def test_overriding_a_low_battery_keeps_it_and_no_battery_is_needed(session, actor_id):
+    phone = await _buy(session, actor_id)
+    out = await testing_service.apply_battery_health(session, phone, actor_id, percent=76, override=True)
+    assert out.overridden and not out.failed
+    assert phone.battery_health == 76          # the real figure still goes on the listing
+    assert await repairs_service.get_active_repair(session, phone) is None and not await _battery_fault(session)
+
+
+async def test_override_after_a_fail_undoes_the_battery_need(session, actor_id):
+    phone = await _buy(session, actor_id)
+    await testing_service.apply_battery_health(session, phone, actor_id, percent=70)
+    assert await _battery_fault(session)
+    await testing_service.apply_battery_health(session, phone, actor_id, percent=70, override=True)
+    assert not await _battery_fault(session)
+    assert await repairs_service.get_active_repair(session, phone) is None
+    assert phone.current_status == "AWAITING_TEST"
+
+
+async def test_override_when_everything_else_is_done_returns_the_phone_to_tested(session, actor_id):
+    phone = await _buy(session, actor_id)
+    await _pass_everything(session, phone, actor_id, except_codes=("battery_health",), condition=False)
+    await cosmetics.set_grade(session, phone, FRAME, "A", actor_id)
+    await cosmetics.set_grade(session, phone, GLASS, "A", actor_id)
+    await testing_service.apply_battery_health(session, phone, actor_id, percent=75)
+    assert phone.current_status == "REPAIR_REQUIRED"
+    await testing_service.apply_battery_health(session, phone, actor_id, percent=75, override=True)
+    assert phone.current_status == "TESTED" and await repairs_service.get_active_repair(session, phone) is None
+
+
+async def test_battery_not_applicable_never_fails(session, actor_id):
+    phone = await _buy(session, actor_id)
+    out = await testing_service.apply_battery_health(session, phone, actor_id, not_applicable=True)
+    assert not out.failed and phone.battery_health_na and not await _battery_fault(session)
+
+
+async def test_battery_test_counts_as_tested_once_the_percent_is_recorded(session, actor_id):
+    """The % step is the only battery question, so it must also satisfy the battery test."""
+    phone = await _buy(session, actor_id)
+    await _pass_everything(session, phone, actor_id, except_codes=("battery_health",), condition=False)
+    await cosmetics.set_grade(session, phone, FRAME, "A", actor_id)
+    await cosmetics.set_grade(session, phone, GLASS, "A", actor_id)
+    await testing_service.apply_battery_health(session, phone, actor_id, percent=92)
+    await testing_service.finish_walkthrough(session, phone, actor_id)
+    assert phone.current_status == "TESTED"

@@ -34,6 +34,10 @@ from app.services.events import log_event
 
 GRADES = ("A*", "A", "B", "C", "D")
 
+# Battery health under this % counts as a failed battery test (the Battery part is needed),
+# unless the tester overrides it. 80 itself passes.
+BATTERY_MIN_HEALTH = 80
+
 # Shown on listings and in Discord. Edit the wording here to change it everywhere.
 GRADE_DESCRIPTIONS = {
     "A*": "like new, no visible marks",
@@ -313,6 +317,9 @@ async def _cancel_repair_if_empty(session: AsyncSession, phone: Phone, repair: R
         await repairs_service.cancel_repair(session, repair, actor, notes="Nothing left to repair")
 
 
+cancel_repair_if_empty = _cancel_repair_if_empty
+
+
 async def _mark_replace_from_stock(session: AsyncSession, phone: Phone, role: str, part_type, grade: str,
                                    actor: int, out: GradeOutcome) -> None:
     """Grade C: if a matching part is in stock, reserve it for this phone. Never orders."""
@@ -397,16 +404,10 @@ async def set_grade(session: AsyncSession, phone: Phone, role: str, grade: str, 
     else:   # A*, A, B: sells as is, so any optional replacement is let go
         out.released = await _drop_optional_line(session, phone, part_type.id, actor)
 
-    if out.fault_cleared and phone.current_status == "REPAIR_REQUIRED":
-        # Only the D fault was holding it in repair: it's no longer waiting on parts.
-        still = (await session.execute(select(PhoneFault).where(
-            PhoneFault.phone_id == phone.id, PhoneFault.status == FaultStatus.OPEN))).scalars().first()
-        active = await repairs_service.get_active_repair(session, phone)
-        if still is None and (active is None or not [rp for rp in active.parts if rp.status in _ACTIVE_LINES]):
-            if active is not None:
-                await _cancel_repair_if_empty(session, phone, active, actor)
-            await phones_service.set_status(session, phone, "TESTED", actor, notes="Grade no longer D")
-            out.new_status = phone.current_status
+    if out.fault_cleared:
+        from app.services import testing as testing_service
+        await testing_service.settle_after_fault_cleared(session, phone, actor, "Grade no longer D")
+        out.new_status = phone.current_status
     return out
 
 

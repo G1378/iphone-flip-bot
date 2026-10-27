@@ -11,7 +11,7 @@ from app.models.config_models import PartTypeConfig, TestDefinition
 from app.models.enums import FaultStatus, InventoryEventType, TestOutcome
 from app.models.inventory_models import Phone, PhoneFault, TestResult
 from app.models.repair_models import Repair
-from app.services import cosmetics
+from app.services import config_service, cosmetics
 from app.services import phones as phones_service
 from app.services import repairs as repairs_service
 from app.services.events import log_event
@@ -49,6 +49,71 @@ async def record_result(
         notes=notes,
     )
     return row
+
+
+async def settle_after_fault_cleared(session: AsyncSession, phone: Phone, actor_discord_id: int, why: str) -> None:
+    """A fault was cancelled outright (battery override, a D re-graded up): if that leaves nothing to repair,
+    drop the empty repair and take the phone out of REPAIR_REQUIRED. It goes back to TESTED if every test and
+    its condition are recorded, otherwise to AWAITING_TEST so the walkthrough carries on."""
+    if phone.current_status != NEEDS_REPAIR_STATUS:
+        return
+    still_open = (await session.execute(select(PhoneFault).where(
+        PhoneFault.phone_id == phone.id, PhoneFault.status == FaultStatus.OPEN))).scalars().first()
+    if still_open is not None:
+        return
+    repair = await repairs_service.get_active_repair(session, phone)
+    if repair is not None:
+        if any(rp.status in ("REQUIRED", "RESERVED", "INSTALLED") for rp in repair.parts):
+            return   # still something to fit (or already fitted: it needs verifying)
+        await cosmetics.cancel_repair_if_empty(session, phone, repair, actor_discord_id)
+    report = await build_report(session, phone)
+    done = not report.failed and not report.not_tested and not report.condition_missing
+    await phones_service.set_status(session, phone, "TESTED" if done else "AWAITING_TEST", actor_discord_id, notes=why)
+
+
+BATTERY_TEST_CODE = "battery_health"   # the test definition the battery % drives (no separate PASS/FAIL question)
+
+
+@dataclass
+class BatteryOutcome:
+    percent: Optional[int] = None
+    not_applicable: bool = False
+    below_minimum: bool = False      # under cosmetics.BATTERY_MIN_HEALTH
+    overridden: bool = False         # under the minimum but kept anyway
+    failed: bool = False             # recorded as a FAIL: the Battery part is needed
+    apply: Optional["ApplyOutcome"] = None
+
+
+async def apply_battery_health(
+    session: AsyncSession, phone: Phone, actor_discord_id: int, *,
+    percent: Optional[int] = None, not_applicable: bool = False, override: bool = False,
+) -> BatteryOutcome:
+    """Record the battery health % (or 'not applicable') and settle the battery test from it.
+
+    Under 80% FAILS the battery test, which flags the Battery part exactly like any failed test
+    (fault, repair line, 'needs ordering' if there's none in stock). `override=True` keeps the
+    battery: the test passes with a note saying so. 80% and over passes."""
+    await cosmetics.set_battery(session, phone, actor_discord_id, percent=percent, not_applicable=not_applicable)
+    out = BatteryOutcome(percent=percent, not_applicable=not_applicable)
+    definition = next((d for d in await config_service.list_test_definitions(session)
+                       if d.code == BATTERY_TEST_CODE), None)
+    if not_applicable:
+        result, notes = TestOutcome.NOT_APPLICABLE, "Battery health not applicable"
+    elif percent < cosmetics.BATTERY_MIN_HEALTH:
+        out.below_minimum = True
+        if override:
+            out.overridden = True
+            result, notes = TestOutcome.PASS, f"Battery health {percent}% (under {cosmetics.BATTERY_MIN_HEALTH}%): overridden, battery kept"
+        else:
+            out.failed = True
+            result, notes = TestOutcome.FAIL, f"Battery health {percent}% (under {cosmetics.BATTERY_MIN_HEALTH}%)"
+    else:
+        result, notes = TestOutcome.PASS, f"Battery health {percent}%"
+    if definition is not None:
+        out.apply = await record_and_apply(session, phone, definition, result, actor_discord_id, notes=notes)
+        if out.apply.fault_resolved:   # e.g. a low reading overridden, or a mistyped % corrected
+            await settle_after_fault_cleared(session, phone, actor_discord_id, "Battery no longer needed")
+    return out
 
 
 async def current_results(session: AsyncSession, phone_id: int) -> dict[int, TestResult]:
