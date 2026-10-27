@@ -17,25 +17,27 @@ from app.services import orders as orders_service
 from app.services import part_failures
 
 
-def _parse_lines(raw: str) -> list[tuple[str, int, Decimal, str]]:
+def _parse_lines(raw: str) -> list[tuple[str, int, Decimal, str, str]]:
     """'Screen,2,35.00,iPhone 13 Pro;Battery,1,20.00,iPhone 13' ->
-    [("Screen", 2, Decimal("35.00"), "iPhone 13 Pro"), ...]. The model is required on every line."""
+    [("Screen", 2, Decimal("35.00"), "iPhone 13 Pro", ""), ...]. The model is required on every line;
+    a 5th field gives the colour (needed for frames and back glass: 'Housing,1,25,iPhone 13,Midnight')."""
     parsed = []
     for chunk in raw.split(";"):
         chunk = chunk.strip()
         if not chunk:
             continue
         bits = [b.strip() for b in chunk.split(",")]
-        if len(bits) != 4 or not bits[3]:
-            raise ValueError(f"Couldn't parse line `{chunk}` — expected `PartType,Qty,UnitCost,Model` "
+        if len(bits) not in (4, 5) or not bits[3]:
+            raise ValueError(f"Couldn't parse line `{chunk}` — expected `PartType,Qty,UnitCost,Model[,Colour]` "
                              "(e.g. `Battery,2,18.00,iPhone 13 Pro`). Every line needs the exact phone model.")
-        part_type_name, qty_str, cost_str, model_name = bits
+        part_type_name, qty_str, cost_str, model_name = bits[:4]
+        colour = bits[4] if len(bits) == 5 else ""
         try:
             qty = int(qty_str)
             cost = Decimal(cost_str)
         except (ValueError, InvalidOperation):
             raise ValueError(f"Couldn't parse quantity/cost on line `{chunk}`.")
-        parsed.append((part_type_name, qty, cost, model_name))
+        parsed.append((part_type_name, qty, cost, model_name, colour))
     return parsed
 
 
@@ -45,7 +47,7 @@ class OrdersCog(commands.Cog):
 
     @app_commands.command(name="order", description="Create a purchase order for parts")
     @app_commands.describe(
-        supplier="Supplier name", lines="PartType,Qty,UnitCost,Model e.g. 'Screen,2,35.00,iPhone 13 Pro;Battery,1,20.00,iPhone 13'",
+        supplier="Supplier name", lines="PartType,Qty,UnitCost,Model[,Colour] e.g. 'Screen,2,35.00,iPhone 13 Pro;Housing,1,25.00,iPhone 13,Midnight'",
         shipping_cost="Shipping cost for the whole order", notes="Notes (optional)",
     )
     @require_authorized()
@@ -60,11 +62,11 @@ class OrdersCog(commands.Cog):
         async with session_scope() as session:
             line_inputs = []
             try:
-                for part_type_name, qty, cost, model_name in parsed_lines:
+                for part_type_name, qty, cost, model_name, colour in parsed_lines:
                     part_type = await config_service.get_or_create_part_type(session, part_type_name)
                     model = await config_service.resolve_phone_model(session, model_name)
                     line_inputs.append(orders_service.OrderLineInput(
-                        part_type_id=part_type.id, quantity=qty, unit_cost=cost, phone_model_id=model.id))
+                        part_type_id=part_type.id, quantity=qty, unit_cost=cost, phone_model_id=model.id, colour=colour))
                 order = await orders_service.create_order(
                     session, supplier, line_inputs, interaction.user.id,
                     shipping_cost=Decimal(str(shipping_cost)), notes=notes,
@@ -76,7 +78,7 @@ class OrdersCog(commands.Cog):
 
         e = discord.Embed(title=f"✅ Order created — {order.internal_id}", colour=discord.Colour.green())
         e.add_field(name="Supplier", value=supplier, inline=True)
-        e.add_field(name="Lines", value="\n".join(f"{n} ({m}) × {q} @ £{c}" for n, q, c, m in parsed_lines), inline=False)
+        e.add_field(name="Lines", value="\n".join(f"{n} ({m}{', ' + col if col else ''}) × {q} @ £{c}" for n, q, c, m, col in parsed_lines), inline=False)
         e.add_field(name="Total (inc. shipping)", value=f"£{order.total_cost()}", inline=False)
         await interaction.response.send_message(embed=e)
 

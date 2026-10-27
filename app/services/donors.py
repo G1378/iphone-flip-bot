@@ -123,6 +123,7 @@ async def teardown(
             cost=Decimal("0"),  # allocated later via allocation service
             condition=item.condition,
             grade_code=item.grade_code,
+            colour=donor.colour,   # frames / back glass: matched against the phone they go on
             testing_status=item.test_result,
             location_id=location.id if location else None,
             status="SCRAPPED" if item.discarded else "AVAILABLE",

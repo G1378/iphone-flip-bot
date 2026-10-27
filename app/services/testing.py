@@ -11,6 +11,7 @@ from app.models.config_models import PartTypeConfig, TestDefinition
 from app.models.enums import FaultStatus, InventoryEventType, TestOutcome
 from app.models.inventory_models import Phone, PhoneFault, TestResult
 from app.models.repair_models import Repair
+from app.services import cosmetics
 from app.services import phones as phones_service
 from app.services import repairs as repairs_service
 from app.services.events import log_event
@@ -206,18 +207,19 @@ class TestReport:
     parts_needed: list[str] = field(default_factory=list)  # de-duplicated part type names
     repair_id: Optional[str] = None
     status: str = ""
+    condition_missing: list[str] = field(default_factory=list)  # frame / back glass grade, battery health
 
     __test__ = False  # not a pytest test class
 
 
 async def finish_walkthrough(session: AsyncSession, phone: Phone, actor_discord_id: int) -> TestReport:
-    """Wrap up a walkthrough: a phone that has every test PASS/N-A and hasn't
-    been looked at yet becomes TESTED. Returns the phone's current state
+    """Wrap up a walkthrough: a phone that has every test PASS/N-A, its condition recorded (frame and
+    back glass grade, battery health) and hasn't been looked at yet becomes TESTED. Returns the phone's current state
     (taken from the database, so earlier failures that were skipped this
     time still count)."""
     report = await build_report(session, phone)
     if (
-        not report.failed and not report.not_tested
+        not report.failed and not report.not_tested and not report.condition_missing
         and phone.current_status in ("PURCHASED", "AWAITING_TEST")
     ):
         await phones_service.set_status(session, phone, "TESTED", actor_discord_id, notes="All tests passed")
@@ -226,7 +228,7 @@ async def finish_walkthrough(session: AsyncSession, phone: Phone, actor_discord_
 
 
 async def build_report(session: AsyncSession, phone: Phone) -> TestReport:
-    report = TestReport(status=phone.current_status)
+    report = TestReport(status=phone.current_status, condition_missing=cosmetics.missing_condition(phone))
     for definition, result in await summary(session, phone):
         outcome = result.result if result else TestOutcome.NOT_TESTED
         if outcome == TestOutcome.PASS:

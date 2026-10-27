@@ -43,7 +43,7 @@ from app.models.enums import FaultStatus, RepairPartLineStatus, TestOutcome
 from app.models.inventory_models import Part, Phone, PhoneFault, TestResult
 from app.models.repair_models import Repair, RepairPart
 from app.models.task_models import OPEN_TASK_STATUSES, JobChannel, PhoneTicketOverride, Task
-from app.services import config_service
+from app.services import config_service, cosmetics
 from app.services import part_failures
 from app.services import parts as parts_service
 from app.services import phones as phones_service
@@ -72,6 +72,7 @@ class Unit:
     kind: str  # RESERVED | IN_STOCK | ON_ORDER | DRAFTED | TO_ORDER
     part: Optional[Part] = None
     order: Optional[Order] = None
+    colour: Optional[str] = None   # frames / back glass still to get: the colour it has to be
 
 
 @dataclass
@@ -117,7 +118,8 @@ async def _orders_by_part_type(session: AsyncSession) -> dict[int, list[list]]:
     )).all()
     out: dict[int, list[list]] = {}
     for line, order in rows:
-        out.setdefault(line.part_type_id, []).append([order, line.quantity - line.received_quantity, line.phone_model_id])
+        out.setdefault(line.part_type_id, []).append(
+            [order, line.quantity - line.received_quantity, line.phone_model_id, line.colour])
     for lst in out.values():
         lst.sort(key=lambda x: x[0].status == "DRAFT")  # stable: placed first
     return out
@@ -132,37 +134,71 @@ def allocate_supply(phones: Sequence[Phone], available: dict[int, list[Part]],
     don't both claim the single one in stock or the single one on order."""
     stock = {k: list(v) for k, v in available.items()}
     incoming = {k: [list(x) for x in v] for k, v in on_order.items()}
-    lines: list[tuple[dt.datetime, int, RepairPart, Optional[int]]] = []
+    lines: list[tuple[dt.datetime, int, RepairPart, Repair, Phone]] = []
     for phone in phones:
         repair = _active_repair(phone)
         for rp in _outstanding_lines(repair):
-            lines.append((repair.created_at or dt.datetime.min.replace(tzinfo=dt.timezone.utc), rp.id, rp,
-                          phone.phone_model_id))
+            lines.append((repair.created_at or dt.datetime.min.replace(tzinfo=dt.timezone.utc), rp.id, rp, repair, phone))
     lines.sort(key=lambda x: (x[0], x[1]))
 
+    # Frames and back glass: the colour each repair has to use. Worked out the first time the repair's
+    # lines are reached (so it sees the stock left by older repairs): a frame and back glass must match
+    # each other, but need not match the phone's original colour.
+    colour_plan: dict[int, dict[str, Optional[str]]] = {}
+
+    def plan_for(repair: Repair, phone: Phone) -> dict[str, Optional[str]]:
+        if repair.id in colour_plan:
+            return colour_plan[repair.id]
+        need = {}   # role -> an outstanding, not-yet-chosen line
+        for rp in _outstanding_lines(repair):
+            role = cosmetics.part_role(rp.required_part_type.name)
+            if role and rp.part is None:
+                need.setdefault(role, rp)
+        plan: dict[str, Optional[str]] = {}
+        if set(need) == {cosmetics.FRAME, cosmetics.GLASS}:
+            def in_stock(role):
+                rp = need[role]
+                return [p for p in stock.get(rp.required_part_type_id, [])
+                        if p.fits_model(phone.phone_model_id) and cosmetics.norm_colour(p.colour)]
+            pair = cosmetics.pick_pair_colour(phone.colour, in_stock(cosmetics.FRAME), in_stock(cosmetics.GLASS))
+            plan = {cosmetics.FRAME: pair, cosmetics.GLASS: pair}
+            if pair is None:   # nothing usable in stock: whatever has to be ordered is ordered to match the phone
+                plan = {cosmetics.FRAME: phone.colour or None, cosmetics.GLASS: phone.colour or None}
+        else:
+            for role in need:
+                plan[role] = cosmetics.counterpart_colour(phone, repair, role)
+        colour_plan[repair.id] = plan
+        return plan
+
     supply: dict[int, list[Unit]] = {}
-    for _, _, rp, model_id in lines:
+    for _, _, rp, repair, phone in lines:
+        model_id = phone.phone_model_id
+        role = cosmetics.part_role(rp.required_part_type.name)
         units: list[Unit] = []
         if rp.status == RepairPartLineStatus.RESERVED and rp.part is not None:
             units.append(Unit("RESERVED", part=rp.part))
             wanted = max(rp.quantity - 1, 0)
         else:
             wanted = max(rp.quantity, 1)
+        want = plan_for(repair, phone).get(role) if role else None
         for _ in range(wanted):
             type_id = rp.required_part_type_id
-            # Only a part tagged for THIS phone's exact model (or an order line for it) counts.
-            fit = next((p for p in stock.get(type_id, []) if p.fits_model(model_id)), None)
+            # Only a part tagged for THIS phone's exact model (and, for frames/back glass, the right colour)
+            # or an order line for it counts.
+            fit = next((p for p in stock.get(type_id, [])
+                        if p.fits_model(model_id) and (role is None or cosmetics.fits_colour(p, want))), None)
             if fit is not None:
                 stock[type_id].remove(fit)
                 units.append(Unit("IN_STOCK", part=fit))
                 continue
             slot = next((s for s in incoming.get(type_id, [])
-                         if s[1] > 0 and model_id is not None and s[2] == model_id), None)
+                         if s[1] > 0 and model_id is not None and s[2] == model_id
+                         and (role is None or not cosmetics.norm_colour(want) or cosmetics.colours_match(s[3], want))), None)
             if slot is not None:
                 slot[1] -= 1
                 units.append(Unit("DRAFTED" if slot[0].status == "DRAFT" else "ON_ORDER", order=slot[0]))
             else:
-                units.append(Unit("TO_ORDER"))
+                units.append(Unit("TO_ORDER", colour=want if role else None))
         supply[rp.id] = units
     return supply
 
@@ -263,7 +299,8 @@ def assess(phone: Phone, ctx: Context) -> Optional[Situation]:
             return Situation(stage="REPAIR", **base)
         return Situation(stage="VERIFY", **base)
 
-    if s in ("PURCHASED", "AWAITING_TEST") and "TEST" not in ctx.overrides.get(phone.id, set()) and untested:
+    if (s in ("PURCHASED", "AWAITING_TEST") and "TEST" not in ctx.overrides.get(phone.id, set())
+            and (untested or not cosmetics.condition_complete(phone))):
         return Situation(stage="TEST", **base)
     if s in ("PURCHASED", "AWAITING_TEST", "TESTED"):
         return Situation(stage="PREP", **base)
@@ -305,7 +342,7 @@ def spec_for(sit: Situation, ctx: Context) -> TicketSpec:
         return TicketSpec("PREP", "🧼 Prep for listing", (
             "Tests are clean. Get it ready to sell:\n"
             "• Clean and disinfect, polish the screen, clear the ports\n"
-            "• Grade it honestly, record final battery health\n"
+            "• Check the frame and back glass grades and battery health still match (`/condition`)\n"
             "• Erase all content, confirm no Apple ID and Find My is **off**\n"
             "• Photos: front, back, sides, screen on, battery health, IMEI, every flaw\n"
             f"• Check the price (`/analyse {pid}`)\n"
@@ -323,11 +360,16 @@ def _test_spec(sit: Situation) -> TicketSpec:
     lines = [f"**Progress:** {sit.recorded}/{sit.total} tests recorded"]
     if sit.untested:
         lines.append(f"**Still to test:** {_names(sit.untested, 12)}")
+    missing = cosmetics.missing_condition(sit.phone)
+    if missing:
+        lines.append(f"**Still to record:** {', '.join(missing)} (graded A*, A, B, C or D per part; battery health "
+                     "or 'not applicable'). `/condition` records them.")
     if sit.phone.current_status == "PURCHASED":
         lines.append(
             "**Check-in first:** photos as received, IMEI matches the advert, iCloud / Activation Lock and "
             "MDM clear, matches the listing. Raise any dispute with the seller now.")
-    lines.append("A failed test raises a repair ticket by itself; when every test is recorded this closes.")
+    lines.append("A failed test raises a repair ticket by itself; a frame or back glass graded D does too. "
+                 "When every test and the condition are recorded this closes.")
     return TicketSpec("TEST", "🧪 Run the tests", "\n".join(lines), "NORMAL", due_days=2)
 
 
@@ -350,8 +392,9 @@ def _repair_spec(sit: Situation, ctx: Context) -> TicketSpec:
                 waiting.append(f"• **{name}** → 📝 draft order `{unit.order.internal_id}` not placed yet")
                 waiting_names.append(f"{name} (order not placed)")
             else:
-                waiting.append(f"• **{name}** → ❌ not in stock, **needs ordering**")
-                waiting_names.append(f"{name} (needs ordering)")
+                col = f" in **{unit.colour}**" if unit.colour else ""
+                waiting.append(f"• **{name}** → ❌ not in stock{col}, **needs ordering**")
+                waiting_names.append(f"{name}{' ' + unit.colour if unit.colour else ''} (needs ordering)")
 
     parts: list[str] = []
     if swap_now:

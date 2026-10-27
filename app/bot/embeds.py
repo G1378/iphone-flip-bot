@@ -31,7 +31,9 @@ def phone_embed(phone, faults=None, test_summary=None) -> discord.Embed:
     e.add_field(name="IMEI", value=phone.imei or "—", inline=True)
     e.add_field(name="Serial", value=phone.serial_number or "—", inline=True)
     e.add_field(name="Lock status", value=phone.lock_status.value, inline=True)
-    e.add_field(name="Battery health", value=f"{phone.battery_health}%" if phone.battery_health else "—", inline=True)
+    e.add_field(name="Battery health", value=f"{phone.battery_health}%" if phone.battery_health else ("n/a" if phone.battery_health_na else "—"), inline=True)
+    e.add_field(name="Frame grade", value=phone.frame_grade or "—", inline=True)
+    e.add_field(name="Back glass grade", value=phone.back_glass_grade or "—", inline=True)
     e.add_field(name="Purchase price", value=f"£{phone.purchase_price}", inline=True)
     e.add_field(name="Purchase date", value=str(phone.purchase_date or "—"), inline=True)
     if phone.seller_source:
@@ -76,6 +78,8 @@ def part_embed(part) -> discord.Embed:
         e.add_field(name="Donor", value=part.source_donor.internal_id, inline=True)
     e.add_field(name="Cost", value=f"£{part.cost}", inline=True)
     e.add_field(name="Grade", value=part.grade_code or "—", inline=True)
+    if part.colour:
+        e.add_field(name="Colour", value=part.colour, inline=True)
     if part.confirmed_working_at:  # parts aren't pre-tested; this is "it worked in a phone"
         e.add_field(name="Proven", value=f"✅ worked in {part.confirmed_working_in}", inline=True)
     e.add_field(name="Location", value=part.location.code if part.location else "—", inline=True)

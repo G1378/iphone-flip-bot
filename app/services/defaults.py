@@ -139,11 +139,11 @@ DEFAULT_PHONE_MODELS = [
 ]
 
 DEFAULT_CONDITION_GRADES = [
-    ("A", "Excellent - like new", 1),
-    ("A-", "Very good - minor wear", 2),
-    ("B", "Good - visible wear", 3),
-    ("B-", "Fair - noticeable wear", 4),
-    ("C", "Heavy wear / cosmetic damage", 5),
+    ("A*", "Like new - no marks", 1),
+    ("A", "Excellent - very light wear", 2),
+    ("B", "Good - visible light wear", 3),
+    ("C", "Fair - heavy wear / damage, sellable as is", 4),
+    ("D", "Poor - must be replaced before sale", 5),
     ("SCRAP", "Not usable", 99),
 ]
 

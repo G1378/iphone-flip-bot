@@ -249,6 +249,7 @@ async def order_part(session: AsyncSession, phone_id: int, rp_id: int, actor: in
     _, units = await _supply(session, phone, rp)
     if not any(u.kind == "TO_ORDER" for u in units):
         raise JobActionError(f"{phone_tickets.part_label(rp, phone)} is already covered by stock or an order.")
+    need_colour = next((u.colour for u in units if u.kind == "TO_ORDER" and u.colour), None)
     supplier = (supplier or "").strip()
     if not supplier:
         raise JobActionError("Who are you ordering it from?")
@@ -260,12 +261,13 @@ async def order_part(session: AsyncSession, phone_id: int, rp_id: int, actor: in
     order = await orders_service.create_order(
         session, supplier,
         [orders_service.OrderLineInput(part_type_id=rp.required_part_type_id, quantity=1, unit_cost=cost,
-                                       phone_model_id=model.id)],
+                                       phone_model_id=model.id, colour=need_colour)],
         actor, shipping_cost=_money(shipping, "Shipping", allow_blank=True), expected_delivery=_date(expected),
-        notes=f"For {phone.internal_id}")
+        notes=f"For {phone.internal_id}" + (f" ({need_colour})" if need_colour else ""))
     await orders_service.mark_ordered(session, order, actor)
     eta = f", due {order.expected_delivery.isoformat()}" if order.expected_delivery else ""
-    return f"Ordered {phone_tickets.part_label(rp, phone)} from {supplier}: `{order.internal_id}` £{cost}{eta}."
+    col = f" in {need_colour}" if need_colour else ""
+    return f"Ordered {phone_tickets.part_label(rp, phone)}{col} from {supplier}: `{order.internal_id}` £{cost}{eta}."
 
 
 async def receive(session: AsyncSession, order_id: int, actor: int) -> str:

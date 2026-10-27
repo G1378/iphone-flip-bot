@@ -13,7 +13,7 @@ from app.bot.auth import require_authorized
 from app.bot.embeds import error_embed, success_embed
 from app.db import session_scope
 from app.models.enums import TestOutcome
-from app.services import config_service, phones as phones_service, testing as testing_service
+from app.services import config_service, cosmetics, phones as phones_service, testing as testing_service
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +45,9 @@ class WalkthroughView(discord.ui.View):
 
     def __init__(self, invoker_id: int, phone_internal_id: str, phone_title: str,
                  steps: list[Step], start_status: str,
-                 on_finish: Optional[Callable[[], Awaitable[None]]] = None):
+                 on_finish: Optional[Callable[[], Awaitable[None]]] = None, record_condition: bool = True):
         super().__init__(timeout=900)
+        self.record_condition = record_condition  # False for a re-test of failed tests only
         self.on_finish = on_finish  # e.g. a job channel redrawing its panel
         self.invoker_id = invoker_id
         self.phone_internal_id = phone_internal_id
@@ -104,6 +105,13 @@ class WalkthroughView(discord.ui.View):
                 )[:1024],
                 inline=False,
             )
+        phone_now = await phones_service.get_phone(session, self.phone_internal_id)
+        cond = [f"Frame **{phone_now.frame_grade or '—'}** · Back glass **{phone_now.back_glass_grade or '—'}**",
+                "Battery " + (f"**{phone_now.battery_health}%**" if phone_now.battery_health is not None
+                              else ("**n/a**" if phone_now.battery_health_na else "**not recorded**"))]
+        e.add_field(name="📱 Condition", value=" · ".join(cond), inline=False)
+        if report.condition_missing:
+            e.add_field(name="⚠️ Still to record", value=", ".join(report.condition_missing) + " - run `/condition`", inline=False)
         if report.parts_needed:
             e.add_field(name="🔧 Parts needed", value=", ".join(report.parts_needed)[:1024], inline=False)
         if report.status != self.start_status:
@@ -132,15 +140,26 @@ class WalkthroughView(discord.ui.View):
         await self._finish(interaction)
 
     async def _finish(self, interaction: discord.Interaction) -> None:
+        self.stop()
+        async with session_scope() as session:
+            phone = await phones_service.get_phone(session, self.phone_internal_id)
+            stages = condition_stages(phone, full=self.record_condition) if phone else []
+        if stages:
+            view = ConditionView(self.invoker_id, self.phone_internal_id, self.phone_title, stages, self._summary_and_hook)
+            view.message = self.message
+            await interaction.response.edit_message(embed=view.embed(), view=view)
+            return
+        await interaction.response.edit_message(embed=await self._summary_and_hook(), view=None)
+
+    async def _summary_and_hook(self) -> discord.Embed:
         async with session_scope() as session:
             embed = await self.summary_embed(session)
-        await interaction.response.edit_message(embed=embed, view=None)
-        self.stop()
         if self.on_finish is not None:
             try:
                 await self.on_finish()
             except Exception:
                 logger.exception("Walkthrough on_finish hook failed")
+        return embed
 
     async def _answer(self, interaction: discord.Interaction, outcome: TestOutcome) -> None:
         async with self._lock:
@@ -208,6 +227,153 @@ class WalkthroughView(discord.ui.View):
             logger.debug("Could not edit timed-out testing message", exc_info=True)
 
 
+# ---------------------------------------------------------------------- condition steps
+GRADE_STYLE = {"A*": discord.ButtonStyle.success, "A": discord.ButtonStyle.success, "B": discord.ButtonStyle.primary,
+               "C": discord.ButtonStyle.secondary, "D": discord.ButtonStyle.danger}
+
+
+def condition_stages(phone, full: bool = True) -> list[str]:
+    """Which condition steps to ask: all of them after a full walkthrough, otherwise only what's missing."""
+    if phone is None or phone.current_status in testing_service.CLOSED_STATUSES:
+        return []
+    stages = []
+    if full or phone.frame_grade not in cosmetics.GRADES:
+        stages.append("frame")
+    if full or phone.back_glass_grade not in cosmetics.GRADES:
+        stages.append("back glass")
+    if full or (phone.battery_health is None and not phone.battery_health_na):
+        stages.append("battery")
+    return stages
+
+
+class BatteryModal(discord.ui.Modal, title="Battery health"):
+    percent = discord.ui.TextInput(label="Battery health % (Settings > Battery)", placeholder="87", max_length=4)
+
+    def __init__(self, view: "ConditionView"):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            pct = int(self.percent.value.strip().rstrip("%"))
+        except ValueError:
+            await interaction.response.send_message(embed=error_embed("Battery health must be a whole number, e.g. 87."), ephemeral=True)
+            return
+        await self.view.record_battery(interaction, percent=pct)
+
+
+class GradeButton(discord.ui.Button):
+    def __init__(self, grade: str):
+        super().__init__(label=grade, style=GRADE_STYLE[grade])
+        self.grade = grade
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.view.record_grade(interaction, self.grade)
+
+
+class ConditionView(discord.ui.View):
+    """The last part of testing: grade the frame, grade the back glass, record battery health.
+
+    Each answer is saved straight away. A D raises a repair for that part; a C marks a replacement
+    if one is in stock (and never orders one)."""
+
+    def __init__(self, invoker_id: int, phone_internal_id: str, phone_title: str, stages: list[str],
+                 done: Callable[[], Awaitable[discord.Embed]]):
+        super().__init__(timeout=900)
+        self.invoker_id, self.phone_internal_id, self.phone_title = invoker_id, phone_internal_id, phone_title
+        self.stages, self.done = stages, done
+        self.index = 0
+        self.notes: list[str] = []
+        self.message: Optional[discord.Message] = None
+        self._lock = asyncio.Lock()
+        self._build_buttons()
+
+    @property
+    def stage(self) -> str:
+        return self.stages[self.index]
+
+    def _build_buttons(self) -> None:
+        self.clear_items()
+        if self.stage == "battery":
+            na = discord.ui.Button(label="Not applicable", style=discord.ButtonStyle.secondary, emoji="➖")
+            na.callback = lambda i: self.record_battery(i, not_applicable=True)
+            enter = discord.ui.Button(label="Enter %", style=discord.ButtonStyle.primary, emoji="🔋")
+            enter.callback = lambda i: i.response.send_modal(BatteryModal(self))
+            self.add_item(enter)
+            self.add_item(na)
+        else:
+            for g in cosmetics.GRADES:
+                self.add_item(GradeButton(g))
+        skip = discord.ui.Button(label="Skip", style=discord.ButtonStyle.secondary, emoji="⏭", row=1)
+        skip.callback = self._skip
+        self.add_item(skip)
+
+    def embed(self) -> discord.Embed:
+        what = {"frame": "Frame", "back glass": "Back glass", "battery": "Battery health"}[self.stage]
+        e = discord.Embed(title=f"📱 Condition - {self.phone_title}", colour=discord.Colour.blue(),
+                          description=f"## {what}\nStep **{self.index + 1}** of **{len(self.stages)}**")
+        if self.stage == "battery":
+            e.add_field(name="Record", value="The % from Settings > Battery > Battery Health. If the phone doesn't show "
+                                             "one (e.g. a non-genuine battery) press **Not applicable**.", inline=False)
+        else:
+            e.add_field(name="Grades", value="\n".join(f"**{g}** {cosmetics.GRADE_DESCRIPTIONS[g]}" for g in cosmetics.GRADES), inline=False)
+            e.add_field(name="What happens", value="**D** must be replaced before sale (added to the repair). "
+                                                    "**C** is sellable as is; a matching one is reserved if you have it in stock, "
+                                                    "but nothing is ever ordered.", inline=False)
+        if self.notes:
+            e.add_field(name="So far", value="\n".join(self.notes)[-1000:], inline=False)
+        return e
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message("This isn't your test run.", ephemeral=True)
+            return False
+        return True
+
+    async def _next(self, interaction: discord.Interaction) -> None:
+        self.index += 1
+        if self.index < len(self.stages):
+            self._build_buttons()
+            await interaction.response.edit_message(embed=self.embed(), view=self)
+            return
+        self.stop()
+        await interaction.response.edit_message(embed=await self.done(), view=None)
+
+    async def _skip(self, interaction: discord.Interaction) -> None:
+        async with self._lock:
+            self.notes.append(f"⏭ {self.stage} skipped")
+            await self._next(interaction)
+
+    async def record_grade(self, interaction: discord.Interaction, grade: str) -> None:
+        async with self._lock:
+            role = cosmetics.FRAME if self.stage == "frame" else cosmetics.GLASS
+            async with session_scope() as session:
+                phone = await phones_service.get_phone(session, self.phone_internal_id)
+                out = await cosmetics.set_grade(session, phone, role, grade, interaction.user.id)
+            self.notes.append("✅ " + out.summary())
+            await self._next(interaction)
+
+    async def record_battery(self, interaction: discord.Interaction, *, percent: Optional[int] = None,
+                             not_applicable: bool = False) -> None:
+        async with self._lock:
+            async with session_scope() as session:
+                phone = await phones_service.get_phone(session, self.phone_internal_id)
+                try:
+                    await cosmetics.set_battery(session, phone, interaction.user.id, percent=percent, not_applicable=not_applicable)
+                except cosmetics.CosmeticError as e:
+                    await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                    return
+            self.notes.append("✅ Battery health " + ("not applicable" if not_applicable else f"**{percent}%**"))
+            await self._next(interaction)
+
+    async def on_timeout(self) -> None:
+        if self.message is not None:
+            try:
+                await self.message.edit(content="⌛ Condition timed out - what you recorded is saved. Run `/condition` to finish.", view=None)
+            except discord.HTTPException:
+                logger.debug("Could not edit timed-out condition message", exc_info=True)
+
+
 async def begin_walkthrough(interaction: discord.Interaction, internal_id: str, *,
                             only_definition_ids: Optional[set[int]] = None,
                             on_finish: Optional[Callable[[], Awaitable[None]]] = None) -> None:
@@ -239,7 +405,8 @@ async def begin_walkthrough(interaction: discord.Interaction, internal_id: str, 
         )
         for d, r in summary
     ]
-    view = WalkthroughView(interaction.user.id, internal_id.upper(), title, steps, start_status, on_finish=on_finish)
+    view = WalkthroughView(interaction.user.id, internal_id.upper(), title, steps, start_status, on_finish=on_finish,
+                           record_condition=only_definition_ids is None)
     await interaction.response.send_message(embed=view.step_embed(), view=view)
     view.message = await interaction.original_response()
 
@@ -297,6 +464,62 @@ class TestingCog(commands.Cog):
             app_commands.Choice(name=d.name, value=d.name)
             for d in definitions if current.lower() in d.name.lower()
         ][:25]
+
+    # ------------------------------------------------------------------ condition
+    @app_commands.command(name="condition", description="Record frame / back glass grade and battery health for a phone")
+    @app_commands.describe(
+        frame="Frame (housing) grade", back_glass="Back glass grade", battery="Battery health % (leave blank if unchanged)",
+        battery_not_applicable="Phone shows no battery health (e.g. non-genuine battery)")
+    @app_commands.choices(
+        frame=[app_commands.Choice(name=f"{g} - {cosmetics.GRADE_DESCRIPTIONS[g]}"[:100], value=g) for g in cosmetics.GRADES],
+        back_glass=[app_commands.Choice(name=f"{g} - {cosmetics.GRADE_DESCRIPTIONS[g]}"[:100], value=g) for g in cosmetics.GRADES])
+    @require_authorized()
+    async def condition(self, interaction: discord.Interaction, internal_id: str,
+                        frame: Optional[app_commands.Choice[str]] = None,
+                        back_glass: Optional[app_commands.Choice[str]] = None,
+                        battery: Optional[int] = None, battery_not_applicable: bool = False):
+        lines: list[str] = []
+        async with session_scope() as session:
+            phone = await phones_service.get_phone(session, internal_id)
+            if not phone:
+                await interaction.response.send_message(embed=error_embed(f"No phone found with ID `{internal_id}`."), ephemeral=True)
+                return
+            try:
+                for role, choice in ((cosmetics.FRAME, frame), (cosmetics.GLASS, back_glass)):
+                    if choice is not None:
+                        lines.append("• " + (await cosmetics.set_grade(session, phone, role, choice.value, interaction.user.id)).summary())
+                if battery is not None or battery_not_applicable:
+                    await cosmetics.set_battery(session, phone, interaction.user.id, percent=battery, not_applicable=battery_not_applicable)
+                    lines.append("• Battery health " + ("not applicable" if battery_not_applicable else f"**{battery}%**"))
+            except cosmetics.CosmeticError as e:
+                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                return
+            missing = cosmetics.missing_condition(phone)
+            title = f"{phone.internal_id} {phone.display_name()}"
+            snapshot = (phone.frame_grade or "—", phone.back_glass_grade or "—", phone.battery_health, phone.battery_health_na)
+        if not lines:
+            lines.append(f"Frame **{snapshot[0]}** · Back glass **{snapshot[1]}** · Battery "
+                         + (f"**{snapshot[2]}%**" if snapshot[2] is not None else ("**n/a**" if snapshot[3] else "**not recorded**")))
+        if missing:
+            lines.append(f"Still to record: {', '.join(missing)}")
+        await interaction.response.send_message(embed=success_embed(f"Condition - {title}", "\n".join(lines)))
+
+    @app_commands.command(name="condition-keep", description="Sell a grade C part as it is: release the replacement that was set aside")
+    @app_commands.choices(part=[app_commands.Choice(name="Frame", value="frame"), app_commands.Choice(name="Back glass", value="back glass")])
+    @require_authorized()
+    async def condition_keep(self, interaction: discord.Interaction, internal_id: str, part: app_commands.Choice[str]):
+        async with session_scope() as session:
+            phone = await phones_service.get_phone(session, internal_id)
+            if not phone:
+                await interaction.response.send_message(embed=error_embed(f"No phone found with ID `{internal_id}`."), ephemeral=True)
+                return
+            try:
+                freed = await cosmetics.waive_replacement(session, phone, part.value, interaction.user.id)
+            except cosmetics.CosmeticError as e:
+                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                return
+        msg = f"`{freed.internal_id}` is back in stock." if freed else "There was no replacement set aside."
+        await interaction.response.send_message(embed=success_embed(f"{part.name} stays as graded on {internal_id}", msg))
 
     @app_commands.command(name="test-result", description="Show recorded test results for a phone")
     @require_authorized()

@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from app.models.config_models import TestDefinition
 from app.models.enums import AcquisitionType, PartSourceType, TestOutcome
 from app.models.task_models import Task
-from app.services import config_service
+from app.services import config_service, cosmetics
 from app.services import orders as orders_service
 from app.services import parts as parts_service
 from app.services import phone_tickets
@@ -52,10 +52,19 @@ async def _record(session, phone, code, outcome, actor_id):
     return await testing_service.record_and_apply(session, phone, await _definition(session, code), outcome, actor_id)
 
 
-async def _pass_everything(session, phone, actor_id, except_codes=()):
+async def _record_condition(session, phone, actor_id, frame="A", glass="A", battery=90):
+    """Testing also records the visual condition and battery health."""
+    await cosmetics.set_grade(session, phone, cosmetics.FRAME, frame, actor_id)
+    await cosmetics.set_grade(session, phone, cosmetics.GLASS, glass, actor_id)
+    await cosmetics.set_battery(session, phone, actor_id, percent=battery)
+
+
+async def _pass_everything(session, phone, actor_id, except_codes=(), condition=True):
     for d in await config_service.list_test_definitions(session):
         if d.code not in except_codes:
             await testing_service.record_and_apply(session, phone, d, TestOutcome.PASS, actor_id)
+    if condition:
+        await _record_condition(session, phone, actor_id)
 
 
 async def _stock(session, actor_id, part_type: str, location: str | None = None, model: str = "iPhone 13"):

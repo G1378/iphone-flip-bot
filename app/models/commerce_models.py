@@ -51,6 +51,7 @@ class OrderLine(Base, TimestampMixin):
     unit_cost: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
     received_quantity: Mapped[int] = mapped_column(default=0)
     notes: Mapped[Optional[str]] = mapped_column(String(200))
+    colour: Mapped[Optional[str]] = mapped_column(String(40))   # frames / back glass: copied onto the received parts
 
     order: Mapped["Order"] = relationship(lazy="selectin", back_populates="lines")
     part_type: Mapped["PartTypeConfig"] = relationship(lazy="selectin")

@@ -29,6 +29,7 @@ class OrderLineInput:
     unit_cost: Decimal
     phone_model_id: Optional[int] = None  # REQUIRED: "Battery" alone is not an orderable part
     notes: Optional[str] = None
+    colour: Optional[str] = None          # frames / back glass: what colour is being ordered
 
 
 async def create_order(
@@ -58,6 +59,7 @@ async def create_order(
             OrderLine(
                 part_type_id=line.part_type_id, phone_model_id=line.phone_model_id,
                 quantity=line.quantity, unit_cost=line.unit_cost, notes=line.notes,
+                colour=(line.colour or "").strip() or None,
             )
         )
     await session.flush()
@@ -116,6 +118,7 @@ async def receive_order(session: AsyncSession, order: Order, actor_discord_id: i
                 source_type=PartSourceType.PURCHASED,
                 source_order_line_id=line.id,
                 cost=line.unit_cost,
+                colour=line.colour,
                 testing_status="NOT_TESTED",
                 status="AVAILABLE",
                 purchase_date=dt.date.today(),

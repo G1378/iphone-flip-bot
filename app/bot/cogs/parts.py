@@ -108,6 +108,22 @@ class PartsCog(commands.Cog):
             label = part.model_label()
         await interaction.response.send_message(embed=success_embed(f"{part_id} now fits: {label}"))
 
+    @app_commands.command(name="part-colour", description="Set a frame / back glass part's colour (they have to match each other)")
+    @app_commands.describe(part_id="e.g. PT-000012", colour="e.g. Midnight, Starlight, Space Grey")
+    @require_authorized()
+    async def part_colour(self, interaction: discord.Interaction, part_id: str, colour: str):
+        async with session_scope() as session:
+            part = await parts_service.get_part(session, part_id)
+            if not part:
+                await interaction.response.send_message(embed=error_embed(f"No part found with ID `{part_id}`."), ephemeral=True)
+                return
+            try:
+                await parts_service.set_part_colour(session, part, colour, interaction.user.id)
+            except parts_service.PartStateError as e:
+                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
+                return
+        await interaction.response.send_message(embed=success_embed(f"{part_id} is now {colour.strip()}"))
+
     @app_commands.command(name="reserve-part", description="Reserve a part against a repair's requirement")
     @require_authorized()
     async def reserve_part(self, interaction: discord.Interaction, part_id: str, repair_id: str):

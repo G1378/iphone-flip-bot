@@ -59,7 +59,8 @@ def build_panel(sit: Situation, ctx: Context) -> PanelSpec:
         ("Status", phone.current_status.replace("_", " ").title()),
         ("Location", phone.location.code if phone.location else "—"),
         ("IMEI", phone.imei or "—"),
-        ("Battery", f"{phone.battery_health}%" if phone.battery_health else "—"),
+        ("Battery", f"{phone.battery_health}%" if phone.battery_health else ("n/a" if phone.battery_health_na else "—")),
+        ("Frame / Glass", f"{phone.frame_grade or '—'} / {phone.back_glass_grade or '—'}"),
         ("Cost", f"£{phone.purchase_price}"),
     ]
     body = spec.body

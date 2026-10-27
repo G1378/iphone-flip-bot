@@ -45,6 +45,13 @@ class Phone(Base, TimestampMixin):
     lock_status: Mapped[LockStatus] = mapped_column(default=LockStatus.UNKNOWN)
 
     battery_health: Mapped[Optional[int]] = mapped_column()  # percentage
+    # True when this phone has no readable battery health (e.g. a non-genuine battery): the
+    # listing then says so instead of nagging for a number. See services/cosmetics.py.
+    battery_health_na: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Visual condition, graded per part so a damaged frame and a damaged back glass are told
+    # apart: A*, A, B, C or D (see services/cosmetics.py). Frame = the "Housing" part type.
+    frame_grade: Mapped[Optional[str]] = mapped_column(String(2))
+    back_glass_grade: Mapped[Optional[str]] = mapped_column(String(2))
     # eBay-hosted photo URLs, in the order they'll show on a listing (first = main image).
     photo_urls: Mapped[Optional[list]] = mapped_column(JSON)
     cosmetic_condition: Mapped[Optional[str]] = mapped_column(String(100))
@@ -149,6 +156,9 @@ class Part(Base, TimestampMixin):
 
     condition: Mapped[Optional[str]] = mapped_column(String(100))
     grade_code: Mapped[Optional[str]] = mapped_column(String(10))
+    # Frames and back glass only: a replacement frame and back glass must match each other
+    # (they need not match the phone's original colour). Unset = can't be verified, so unused.
+    colour: Mapped[Optional[str]] = mapped_column(String(40))
     testing_status: Mapped[TestOutcome] = mapped_column(default=TestOutcome.NOT_TESTED)  # legacy: parts are no longer pre-tested
 
     # Set when someone confirms the part worked after fitting it. Parts are never
@@ -189,7 +199,8 @@ class Part(Base, TimestampMixin):
 
     def display_name(self) -> str:
         """e.g. 'Battery (iPhone 13 Pro)'."""
-        return f"{self.part_type.name if self.part_type else 'Part'} ({self.model_label()})"
+        base = f"{self.part_type.name if self.part_type else 'Part'} ({self.model_label()})"
+        return f"{base} · {self.colour}" if self.colour else base
 
 
 class PhoneFault(Base, TimestampMixin):

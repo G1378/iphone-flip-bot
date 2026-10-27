@@ -22,7 +22,7 @@ from sqlalchemy.orm import selectinload
 from app.models.commerce_models import Listing
 from app.models.enums import LockStatus, PartSourceType
 from app.models.inventory_models import Part, Phone
-from app.services import config_service
+from app.services import config_service, cosmetics
 from app.services import pricing as pricing_service
 
 TITLE_MAX = 80
@@ -100,11 +100,17 @@ def build_description(phone: Phone, fitted: list[Part], whats_included: str, ext
     out = [f"{phone.manufacturer} {phone.model}".upper() if len(phone.model) < 30 else phone.model.upper(),
            " ".join(b for b in (phone.variant, storage_label(phone.storage), phone.colour, _network(phone)) if b)]
     cond = ["CONDITION"]
-    cond.append(f"Cosmetic: {phone.cosmetic_condition}" if phone.cosmetic_condition else "Cosmetic condition: see photos.")
+    graded = cosmetics.condition_lines(phone)
+    if graded:
+        cond += graded
+    else:
+        cond.append(f"Cosmetic: {phone.cosmetic_condition}" if phone.cosmetic_condition else "Cosmetic condition: see photos.")
     if phone.functional_condition:
         cond.append(f"Working order: {phone.functional_condition}")
     if phone.battery_health:
         cond.append(f"Battery health: {phone.battery_health}%")
+    elif phone.battery_health_na:
+        cond.append("Battery health: not shown by this phone")
     blocks = ["\n".join(x for x in out if x), "\n".join(cond)]
     if fitted:
         lines = ["REPAIR HISTORY"] + [f"• Replacement {p.part_type.name.lower()} fitted" for p in fitted]
@@ -118,7 +124,10 @@ def build_description(phone: Phone, fitted: list[Part], whats_included: str, ext
 
 def build_condition_description(phone: Phone, fitted: list[Part]) -> str:
     bits = []
-    if phone.cosmetic_condition:
+    if cosmetics.overall_grade(phone):
+        bits.append(f"{phone.cosmetic_condition or 'Grade ' + cosmetics.overall_grade(phone)} "
+                    f"(frame {phone.frame_grade}, back glass {phone.back_glass_grade})")
+    elif phone.cosmetic_condition:
         bits.append(phone.cosmetic_condition.rstrip("."))
     if phone.functional_condition:
         bits.append(f"fully tested: {phone.functional_condition}".rstrip("."))
@@ -148,9 +157,12 @@ async def build_for_phone(session: AsyncSession, phone: Phone) -> BuiltListing:
         warnings.append("Colour isn't set")
     if phone.lock_status == LockStatus.UNKNOWN:
         warnings.append("Lock status is unknown: set it so the listing can say Unlocked or Locked")
+    for role in (cosmetics.FRAME, cosmetics.GLASS):
+        if cosmetics.grade_of(phone, role) not in cosmetics.GRADES:
+            warnings.append(f"{cosmetics.ROLE_LABEL[role]} hasn't been graded: `/condition`")
     if not phone.cosmetic_condition:
         warnings.append("No cosmetic condition recorded (the listing says 'see photos')")
-    if not phone.battery_health:
+    if not phone.battery_health and not phone.battery_health_na:
         warnings.append("No battery health recorded")
     if not whats.strip():
         warnings.append("'What's included' not set: `/config business key:listing_whats_included value:...`")
@@ -209,6 +221,8 @@ def blockers(listing: Listing, phone: Phone) -> list[str]:
     """What stops this listing being published right now. Pure, so the job-channel panel and
     the Publish button use the same answer."""
     out = []
+    for role in cosmetics.needs_replacing(phone):
+        out.append(f"The {cosmetics.ROLE_LABEL[role].lower()} is graded D: replace it before listing")
     if not phone.photo_urls:
         out.append("No photos yet: post them with `/photos` in this channel")
     if not listing.price or listing.price <= 0:

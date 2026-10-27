@@ -600,7 +600,7 @@ def _map_condition(condition_text: str) -> str:
         return "USED_EXCELLENT"
     if "good" in t or "grade b" in t:
         return "USED_GOOD"
-    if "fair" in t or "grade c" in t:
+    if "fair" in t or "grade c" in t or "grade d" in t:
         return "USED_ACCEPTABLE"
     if "faulty" in t or "parts" in t or "not working" in t:
         return "FOR_PARTS_OR_NOT_WORKING"

@@ -12,7 +12,7 @@ from sqlalchemy.orm import selectinload
 from app.models.enums import InventoryEventType, PartSourceType, TestOutcome
 from app.models.inventory_models import Part, PartCompatibleModel, Phone
 from app.models.repair_models import Repair, RepairPart, RepairPartLineStatus
-from app.services import config_service
+from app.services import config_service, cosmetics
 from app.services.events import log_event
 from app.services.ids import next_internal_id
 
@@ -53,6 +53,7 @@ class CreatePartInput:
     notes: Optional[str] = None
     compatible_model_ids: Optional[list[int]] = None  # REQUIRED: every part is for specific models
     source_order_line_id: Optional[int] = None
+    colour: Optional[str] = None  # frames / back glass: they must match each other
 
 
 async def create_part(session: AsyncSession, data: CreatePartInput, actor_discord_id: int) -> Part:
@@ -75,6 +76,7 @@ async def create_part(session: AsyncSession, data: CreatePartInput, actor_discor
         cost=data.cost,
         condition=data.condition,
         grade_code=data.grade_code,
+        colour=(data.colour or "").strip() or None,
         testing_status=data.testing_status,
         location_id=location.id if location else None,
         status="AVAILABLE",
@@ -149,14 +151,40 @@ async def set_part_models(session: AsyncSession, part: Part, model_ids: Sequence
     return part
 
 
+def _assert_colour(part: Part, phone, repair) -> None:
+    try:
+        cosmetics.check_colour(part, phone, repair)
+    except cosmetics.ColourMismatchError as e:
+        raise PartFitError(str(e))
+
+
+async def set_part_colour(session: AsyncSession, part: Part, colour: str, actor_discord_id: int) -> Part:
+    """Record a part's colour. Not allowed while it is reserved or fitted (it was matched on the old one)."""
+    colour = (colour or "").strip()
+    if not colour:
+        raise PartStateError("Give the colour, e.g. 'Midnight'.")
+    if part.status in ("RESERVED", "INSTALLED"):
+        raise PartStateError(f"{part.internal_id} is {part.status}; release or remove it before changing its colour.")
+    before, part.colour = part.colour, colour
+    await session.flush()
+    await log_event(
+        session, event_type=InventoryEventType.MANUAL_ADJUSTMENT.value, entity_type="PART",
+        entity_id=part.internal_id, actor_discord_id=actor_discord_id,
+        previous_state={"colour": before}, new_state={"colour": colour},
+    )
+    return part
+
+
 async def reserve_part(session: AsyncSession, part: Part, repair: Repair, repair_part: RepairPart,
                         actor_discord_id: int) -> Part:
     if part.status != "AVAILABLE":
         raise PartStateError(f"{part.internal_id} is not AVAILABLE (currently {part.status}).")
     await assert_part_fits(session, part, repair.phone)
+    _assert_colour(part, repair.phone, repair)
     part.status = "RESERVED"
     part.reserved_for_repair_id = repair.id
     repair_part.part_id = part.id
+    repair_part.part = part   # keep the relationship in step so colour checks see it straight away
     repair_part.status = RepairPartLineStatus.RESERVED
     repair_part.reserved_at = dt.datetime.now(dt.timezone.utc)
     await session.flush()
@@ -181,6 +209,7 @@ async def unreserve_part(session: AsyncSession, part: Part, repair_part: RepairP
     part.status = "AVAILABLE"
     part.reserved_for_repair_id = None
     repair_part.part_id = None
+    repair_part.part = None
     repair_part.status = RepairPartLineStatus.REQUIRED
     repair_part.reserved_at = None
     await session.flush()
@@ -202,9 +231,12 @@ async def install_part(session: AsyncSession, part: Part, phone: Phone, repair_p
     if part.status not in ("RESERVED", "AVAILABLE"):
         raise PartStateError(f"{part.internal_id} cannot be installed from status {part.status}.")
     await assert_part_fits(session, part, phone)
+    _assert_colour(part, phone, repair_part.repair)
     part.status = "INSTALLED"
     part.installed_phone_id = phone.id
     part.reserved_for_repair_id = None
+    repair_part.part_id = part.id
+    repair_part.part = part
     repair_part.status = RepairPartLineStatus.INSTALLED
     repair_part.installed_at = dt.datetime.now(dt.timezone.utc)
     repair_part.cost_at_installation = part.cost
@@ -220,6 +252,7 @@ async def install_part(session: AsyncSession, part: Part, phone: Phone, repair_p
         related_entity_id=phone.internal_id,
         new_state={"status": "INSTALLED", "cost_at_installation": str(part.cost)},
     )
+    await cosmetics.on_part_installed(session, phone, part, repair_part, actor_discord_id)
     return part
 
 
