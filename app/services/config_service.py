@@ -22,6 +22,7 @@ from app.models.config_models import (
     WorkflowStatus,
 )
 from app.services import defaults as d
+from app.services import phone_catalogue
 
 
 # ----------------------------------------------------------------------
@@ -334,15 +335,75 @@ def canonical_model_name(text: str) -> str:
 
 
 async def ensure_default_phone_models(session: AsyncSession) -> None:
-    """Add any default model missing from the catalog. Idempotent; never touches
-    existing rows (so a model an admin switched off stays off)."""
-    existing = {model_key(m.model + (m.variant or "")) for m in
-                (await session.execute(select(PhoneModelConfig))).scalars().all()}
-    for name in d.DEFAULT_PHONE_MODELS:
-        if model_key(name) not in existing:
-            session.add(PhoneModelConfig(manufacturer="Apple", model=name))
-            existing.add(model_key(name))
+    """Make sure every model in the catalogue exists with its series, place in the list and its storage /
+    colour options. Idempotent. A model an admin switched off stays off, and an option list someone has
+    already set is never overwritten (only blanks are filled)."""
+    rows = (await session.execute(select(PhoneModelConfig))).scalars().all()
+    existing = {model_key(m.model + (m.variant or "")): m for m in rows}
+    for item in phone_catalogue.CATALOGUE:
+        row = existing.get(model_key(item.name))
+        if row is None:
+            row = PhoneModelConfig(manufacturer="Apple", model=item.name)
+            session.add(row)
+            existing[model_key(item.name)] = row
+        row.series = item.series
+        row.sort_order = item.sort_order
+        if not row.storage_options:
+            row.storage_options = list(item.storage)
+        if not row.colourways:
+            row.colourways = list(item.colours)
     await session.flush()
+
+
+def model_options(model: PhoneModelConfig) -> tuple[list[str], list[str]]:
+    """(storage sizes, colourways) offered for a model; either may be empty for a custom model."""
+    return list(model.storage_options or []), list(model.colourways or [])
+
+
+def series_of(model: PhoneModelConfig) -> str:
+    return model.series or phone_catalogue.OTHER_SERIES
+
+
+def group_by_series(models: Sequence[PhoneModelConfig]) -> list[tuple[str, list[PhoneModelConfig]]]:
+    """[(series, [models])] oldest series first, each series' models in tier order. Models that belong to
+    no series (added by hand) come last under 'Other models'."""
+    groups: dict[str, list[PhoneModelConfig]] = {}
+    for m in sorted(models, key=lambda m: (m.sort_order, m.model)):
+        groups.setdefault(series_of(m), []).append(m)
+    return list(groups.items())
+
+
+async def all_colourways(session: AsyncSession) -> list[str]:
+    """Every colour name any model comes in (for colouring parts: the names must match the phones')."""
+    seen: dict[str, str] = {}
+    for m in await list_phone_models(session):
+        for c in m.colourways or []:
+            seen.setdefault(c.lower(), c)
+    return sorted(seen.values(), key=str.lower)
+
+
+async def set_model_options(session: AsyncSession, model: PhoneModelConfig, *, storage: Optional[list[str]] = None,
+                            colours: Optional[list[str]] = None, series: Optional[str] = None) -> PhoneModelConfig:
+    """Replace a model's dropdown options (admin). Storage is normalised to '128GB' / '1TB' form."""
+    if storage is not None:
+        model.storage_options = [normalise_storage(x) for x in storage if x.strip()]
+    if colours is not None:
+        model.colourways = [c.strip() for c in colours if c.strip()]
+    if series:
+        model.series = series.strip()
+    await session.flush()
+    return model
+
+
+def normalise_storage(text: str) -> str:
+    """'128', '128 gb', '128G' -> '128GB'; '1tb' -> '1TB'."""
+    t = text.strip().upper().replace(" ", "")
+    for unit in ("GB", "TB"):
+        if t.endswith(unit):
+            return t
+    if t.endswith("G") or t.endswith("T"):
+        return t + "B"
+    return t + "GB" if t.isdigit() else t
 
 
 async def resolve_phone_model(session: AsyncSession, text: str, variant: Optional[str] = None) -> PhoneModelConfig:
@@ -399,12 +460,55 @@ async def phone_model_for(session: AsyncSession, holder) -> PhoneModelConfig:
 
 async def list_phone_models(session: AsyncSession) -> Sequence[PhoneModelConfig]:
     return (
-        await session.execute(select(PhoneModelConfig).where(PhoneModelConfig.active.is_(True)).order_by(PhoneModelConfig.model))
+        await session.execute(select(PhoneModelConfig).where(PhoneModelConfig.active.is_(True)).order_by(PhoneModelConfig.sort_order, PhoneModelConfig.model))
     ).scalars().all()
 
 
+# What people type for a part vs. the configured part type it means. Only used when the configured type
+# exists, so renaming a part type in /config never breaks it.
+PART_TYPE_ALIASES = {
+    "display": "Screen", "lcd": "Screen", "oled": "Screen", "digitiser": "Screen", "digitizer": "Screen",
+    "rear glass": "Back Glass", "backglass": "Back Glass", "back cover": "Back Glass", "back": "Back Glass",
+    "frame": "Housing", "chassis": "Housing", "midframe": "Housing", "mid frame": "Housing",
+    "charging port": "Charging Port / Flex", "charge port": "Charging Port / Flex", "charging flex": "Charging Port / Flex",
+    "dock": "Charging Port / Flex", "dock connector": "Charging Port / Flex", "charging port flex": "Charging Port / Flex",
+    "back camera": "Rear Camera", "camera": "Rear Camera", "main camera": "Rear Camera",
+    "selfie camera": "Front Camera", "taptic engine": "Vibration Motor", "taptic": "Vibration Motor",
+    "vibrator": "Vibration Motor", "sim": "SIM Tray", "sim card tray": "SIM Tray", "motherboard": "Logic Board",
+    "mainboard": "Logic Board", "faceid": "Face ID Module", "face id": "Face ID Module",
+    "ear speaker": "Earpiece", "loudspeaker": "Speaker", "loud speaker": "Speaker",
+}
+
+
+def part_type_key(name: str) -> str:
+    """'  back   GLASS ' / 'Back-Glass' -> 'back glass' (case, spacing and punctuation don't matter)."""
+    return " ".join("".join(ch if ch.isalnum() else " " for ch in (name or "").lower()).split())
+
+
+async def find_part_type(session: AsyncSession, name: str, *, active_only: bool = True) -> Optional[PartTypeConfig]:
+    """The configured (active) part type a typed name means: ignoring case/spacing/punctuation, then common
+    names ('display' -> Screen). None if there isn't one: it never creates a type."""
+    key = part_type_key(name)
+    if not key:
+        return None
+    stmt = select(PartTypeConfig).order_by(PartTypeConfig.active.desc(), PartTypeConfig.id)
+    if active_only:
+        stmt = stmt.where(PartTypeConfig.active.is_(True))
+    rows = (await session.execute(stmt)).scalars().all()
+    by_key = {}
+    for r in rows:
+        by_key.setdefault(part_type_key(r.name), r)
+    if key in by_key:
+        return by_key[key]
+    target = PART_TYPE_ALIASES.get(key)
+    return by_key.get(part_type_key(target)) if target else None
+
+
 async def get_or_create_part_type(session: AsyncSession, name: str) -> PartTypeConfig:
-    row = (await session.execute(select(PartTypeConfig).where(PartTypeConfig.name == name))).scalar_one_or_none()
+    """Find the part type by name (any case, common aliases) or create it. 'battery' is the existing
+    'Battery', not a second type with no stock."""
+    name = (name or "").strip()
+    row = await find_part_type(session, name, active_only=False)
     if row:
         return row
     row = PartTypeConfig(name=name)
@@ -442,15 +546,6 @@ async def find_test_definition(session: AsyncSession, name: str) -> Optional[Tes
     for t in await list_test_definitions(session):
         if t.name.lower() == key or t.code == key.replace(" ", "_"):
             return t
-    return None
-
-
-async def find_part_type(session: AsyncSession, name: str) -> Optional[PartTypeConfig]:
-    """Active part type by name (case-insensitive). Does not create one."""
-    key = name.strip().lower()
-    for p in await list_part_types(session):
-        if p.name.lower() == key:
-            return p
     return None
 
 

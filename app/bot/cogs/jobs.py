@@ -131,14 +131,17 @@ class _Form(discord.ui.Modal):
 
 
 class FaultForm(_Form):
-    def __init__(self, cog, phone_id):
-        super().__init__(cog, phone_id, "Log a fault")
+    """Just the description: the part that fixes it was picked from the dropdown (so it is always a real
+    part type, never a typo that quietly creates one with nothing in stock)."""
+
+    def __init__(self, cog, phone_id, part_type_id: Optional[int] = None, part_name: str = ""):
+        super().__init__(cog, phone_id, f"Log a fault: {part_name}"[:45] if part_name else "Log a fault")
+        self.part_type_id = part_type_id
         self.description = self.field("What's wrong?", long=True, max_length=300)
-        self.part = self.field("Part that fixes it (optional)", required=False, max_length=60, placeholder="e.g. Screen, Battery")
 
     async def on_submit(self, interaction):
         await self.run(interaction, lambda s, actor: job_actions.log_fault(
-            s, self.phone_id, actor, description=self.description.value, part_type_name=self.part.value))
+            s, self.phone_id, actor, description=self.description.value, part_type_id=self.part_type_id))
 
 
 class DetailsForm(_Form):
@@ -234,6 +237,59 @@ class _Picker(discord.ui.View):
             await interaction.response.send_message("This menu isn't yours.", ephemeral=True)
             return False
         return True
+
+
+class PartTypeView(_Picker):
+    """Which part does the fault need? Every option says how many are already on the shelf for this phone's
+    model, so stock is what you see first, before anyone thinks about ordering."""
+
+    NONE = "0"
+
+    def __init__(self, cog: "JobsCog", invoker_id: int, phone_id: int, choices):
+        super().__init__(invoker_id)
+        self.cog, self.phone_id = cog, phone_id
+        self.names = {str(c.id): c.name for c in choices}
+        options = [discord.SelectOption(label="No part needed / not sure", value=self.NONE, emoji="❔")]
+        for c in sorted(choices, key=lambda c: (c.in_stock == 0, c.on_order == 0, c.name.lower()))[:24]:
+            if c.in_stock:
+                desc, emoji = f"{c.in_stock} in stock: reserve and fit it", "✅"
+            elif c.on_order:
+                desc, emoji = f"None in stock, {c.on_order} on order", "📦"
+            else:
+                desc, emoji = "None in stock: would need ordering", "❌"
+            options.append(discord.SelectOption(label=c.name[:100], value=str(c.id), description=desc, emoji=emoji))
+        select = discord.ui.Select(placeholder="Which part fixes it?", options=options)
+        select.callback = self._picked
+        self.select = select
+        self.add_item(select)
+
+    async def _picked(self, interaction: discord.Interaction):
+        value = self.select.values[0]
+        part_type_id = None if value == self.NONE else int(value)
+        await interaction.response.send_modal(FaultForm(self.cog, self.phone_id, part_type_id, self.names.get(value, "")))
+
+
+class PartColourView(_Picker):
+    """A frame / back glass in stock has no colour recorded: ask once, then reserve it."""
+
+    def __init__(self, cog: "JobsCog", invoker_id: int, phone_id: int, need: "job_actions.PartColourNeeded"):
+        super().__init__(invoker_id)
+        self.cog, self.phone_id, self.need = cog, phone_id, need
+        if need.match_colour:
+            same = discord.ui.Button(label=f"It's {need.match_colour} (matches the phone)"[:80],
+                                     style=discord.ButtonStyle.success, emoji="✅")
+            same.callback = lambda i: self._reserve(i, need.match_colour)
+            self.add_item(same)
+        if need.choices:
+            select = discord.ui.Select(placeholder="Or pick its colour",
+                                       options=[discord.SelectOption(label=c[:100], value=c) for c in need.choices[:25]], row=1)
+            select.callback = lambda i: self._reserve(i, select.values[0])
+            self.add_item(select)
+
+    async def _reserve(self, interaction: discord.Interaction, colour: str):
+        need = self.need
+        await self.cog.run_action(interaction, self.phone_id, lambda s, actor: job_actions.reserve(
+            s, self.phone_id, need.rp_id, actor, part_id=need.part_id, part_colour=colour))
 
 
 class SingleTestView(_Picker):
@@ -621,6 +677,13 @@ class JobsCog(commands.Cog):
         try:
             async with session_scope() as session:
                 message = await action(session, interaction.user.id)
+        except job_actions.PartColourNeeded as need:
+            embed = discord.Embed(title=f"What colour is {need.part_label}?", colour=discord.Colour.gold(),
+                                  description="Frames and back glass have to match each other, so the colour is needed "
+                                              "before it can be reserved. It is saved on the part for next time.")
+            await interaction.followup.send(embed=embed, view=PartColourView(self, interaction.user.id, phone_id, need),
+                                            ephemeral=True)
+            return
         except (JobActionError, PhoneTicketError, part_failures.PartFailureError, parts_service.PartStateError,
                 repairs_service.RepairError) as e:
             await interaction.followup.send(embed=error_embed(str(e)), ephemeral=True)
@@ -708,7 +771,17 @@ class JobsCog(commands.Cog):
                 name = (f"{rp.required_part_type.name} ({rp.repair.phone.model})" if rp else "part")
             await interaction.response.send_modal(OrderForm(self, phone_id, ref, name))
             return
-        forms = {"fault": FaultForm, "edit": DetailsForm, "move": MoveForm, "find": FindPartForm}
+        if act == "fault":
+            async with session_scope() as session:
+                choices = await job_actions.part_choices(session, phone_id)
+            if not choices:
+                await interaction.response.send_modal(FaultForm(self, phone_id))
+                return
+            await interaction.response.send_message(
+                "**What does it need?** Parts already in stock are marked ✅ and can be reserved straight away.",
+                ephemeral=True, view=PartTypeView(self, user, phone_id, choices))
+            return
+        forms = {"edit": DetailsForm, "move": MoveForm, "find": FindPartForm}
         if act in forms:
             await interaction.response.send_modal(forms[act](self, phone_id))
             return

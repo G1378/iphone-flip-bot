@@ -18,6 +18,7 @@ import hashlib
 from dataclasses import dataclass, field
 
 from app.models.enums import RepairPartLineStatus
+from app.services import cosmetics
 from app.services import listing_builder
 from app.services import parts as parts_service
 from app.services.phone_tickets import Context, Situation, part_label, spec_for
@@ -161,7 +162,10 @@ def _line_actions(sit: Situation, ctx: Context) -> list[ActionSpec]:
         if unit.kind == "RESERVED":
             fit.append(ActionSpec("fit", rp.id, _clip(f"🔧 Fitted: {name} ({unit.part.internal_id})"), "success", "line"))
         elif unit.kind == "IN_STOCK":
-            reserve.append(ActionSpec("reserve", rp.id, _clip(f"📥 Reserve {name} ({unit.part.internal_id})"), "primary", "line"))
+            colour_note = ""
+            if cosmetics.part_role(rp.required_part_type.name) and not cosmetics.norm_colour(unit.part.colour):
+                colour_note = " · colour?"   # asked for when you press it
+            reserve.append(ActionSpec("reserve", rp.id, _clip(f"📥 Reserve {name} ({unit.part.internal_id}){colour_note}"), "primary", "line"))
             if len(parts_service.fitting_parts(ctx.available.get(rp.required_part_type_id, []),
                                                sit.phone.phone_model_id)) > 1:
                 alt.append(ActionSpec("alt", rp.id, _clip(f"🔍 Other {name} options"), "secondary", "line"))

@@ -7,6 +7,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from app.bot.auth import require_authorized
+from app.bot.autocomplete import any_colour_autocomplete
 from app.bot.autocomplete import phone_model_autocomplete
 from app.bot.embeds import error_embed, part_embed, success_embed
 from app.bot.pagination import send_paginated
@@ -110,6 +111,7 @@ class PartsCog(commands.Cog):
 
     @app_commands.command(name="part-colour", description="Set a frame / back glass part's colour (they have to match each other)")
     @app_commands.describe(part_id="e.g. PT-000012", colour="e.g. Midnight, Starlight, Space Grey")
+    @app_commands.autocomplete(colour=any_colour_autocomplete)
     @require_authorized()
     async def part_colour(self, interaction: discord.Interaction, part_id: str, colour: str):
         async with session_scope() as session:

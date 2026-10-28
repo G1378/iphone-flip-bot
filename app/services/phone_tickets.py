@@ -125,6 +125,33 @@ async def _orders_by_part_type(session: AsyncSession) -> dict[int, list[list]]:
     return out
 
 
+def _pick_stock(stock: list[Part], model_id: Optional[int], role: Optional[str], want: Optional[str]) -> Optional[Part]:
+    """The in-stock part to use for a line. A frame / back glass whose colour is known and right comes first;
+    one with no colour recorded still counts (it is asked for when you reserve it) rather than hiding real
+    stock and pushing you to order; one that is the wrong colour never does."""
+    candidates = [p for p in stock if p.fits_model(model_id)]
+    if role is None:
+        return candidates[0] if candidates else None
+    verified = [p for p in candidates if cosmetics.norm_colour(p.colour) and cosmetics.fits_colour(p, want)]
+    unverified = [p for p in candidates if not cosmetics.norm_colour(p.colour)]
+    return (verified or unverified or [None])[0]
+
+
+def stock_hint(rp: RepairPart, phone: Phone, available: dict[int, list[Part]]) -> str:
+    """When a part shows 'needs ordering' although the shelf has that part type: say why it can't be used."""
+    others = [p for p in available.get(rp.required_part_type_id, []) if not p.fits_model(phone.phone_model_id)]
+    if not others:
+        return ""
+    untagged = sum(1 for p in others if not p.compatible_model_ids())
+    elsewhere = len(others) - untagged
+    bits = []
+    if elsewhere:
+        bits.append(f"{elsewhere} for other models")
+    if untagged:
+        bits.append(f"{untagged} with no model set (`/part-models`)")
+    return f" ⚠️ {rp.required_part_type.name} in stock but not usable here: {', '.join(bits)}"
+
+
 def allocate_supply(phones: Sequence[Phone], available: dict[int, list[Part]],
                     on_order: dict[int, list[list]]) -> dict[int, list[Unit]]:
     """Work out, for every outstanding repair line across *all* phones, whether
@@ -185,8 +212,7 @@ def allocate_supply(phones: Sequence[Phone], available: dict[int, list[Part]],
             type_id = rp.required_part_type_id
             # Only a part tagged for THIS phone's exact model (and, for frames/back glass, the right colour)
             # or an order line for it counts.
-            fit = next((p for p in stock.get(type_id, [])
-                        if p.fits_model(model_id) and (role is None or cosmetics.fits_colour(p, want))), None)
+            fit = _pick_stock(stock.get(type_id, []), model_id, role, want)
             if fit is not None:
                 stock[type_id].remove(fit)
                 units.append(Unit("IN_STOCK", part=fit))
@@ -393,7 +419,7 @@ def _repair_spec(sit: Situation, ctx: Context) -> TicketSpec:
                 waiting_names.append(f"{name} (order not placed)")
             else:
                 col = f" in **{unit.colour}**" if unit.colour else ""
-                waiting.append(f"• **{name}** → ❌ not in stock{col}, **needs ordering**")
+                waiting.append(f"• **{name}** → ❌ not in stock{col}, **needs ordering**{stock_hint(rp, sit.phone, ctx.available)}")
                 waiting_names.append(f"{name}{' ' + unit.colour if unit.colour else ''} (needs ordering)")
 
     parts: list[str] = []

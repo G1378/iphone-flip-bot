@@ -237,11 +237,19 @@ class ConfigCog(commands.GroupCog, group_name="config"):
                 await interaction.response.send_message(embed=e)
 
     # ------------------------------------------------------------------
-    @app_commands.command(name="phone-models", description="Manage phone model catalog and default sale prices")
+    @app_commands.command(name="phone-models", description="Manage the phone model list: series, storage sizes, colours, prices")
+    @app_commands.describe(
+        model="Model name, e.g. 'iPhone 13 Pro'",
+        default_sale_price="Default sale price",
+        series="Which generation it belongs to, e.g. 'iPhone 13 series' (a new model goes under 'Other models' without one)",
+        storage="Dropdown sizes, comma separated: 128GB,256GB,512GB",
+        colours="Dropdown colours, comma separated: Midnight,Starlight,Blue")
     @app_commands.choices(action=ADD_REMOVE_LIST)
+    @app_commands.autocomplete(model=phone_model_autocomplete)
     @require_admin()
     async def phone_models(self, interaction: discord.Interaction, action: app_commands.Choice[str],
-                            model: Optional[str] = None, default_sale_price: Optional[float] = None):
+                            model: Optional[str] = None, default_sale_price: Optional[float] = None,
+                            series: Optional[str] = None, storage: Optional[str] = None, colours: Optional[str] = None):
         async with session_scope() as session:
             if action.value == "add":
                 if not model:
@@ -250,12 +258,26 @@ class ConfigCog(commands.GroupCog, group_name="config"):
                 m = await config_service.get_or_create_phone_model(session, "Apple", model)
                 if default_sale_price is not None:
                     m.default_sale_price = Decimal(str(default_sale_price))
-                await interaction.response.send_message(embed=success_embed(f"Model '{m.model}' saved" + (f" (default price £{default_sale_price})" if default_sale_price else "")))
+                await config_service.set_model_options(
+                    session, m, series=series,
+                    storage=[x for x in storage.split(",")] if storage else None,
+                    colours=[x for x in colours.split(",")] if colours else None)
+                s_, c_ = config_service.model_options(m)
+                await interaction.response.send_message(embed=success_embed(
+                    f"Model '{m.model}' saved",
+                    f"Series: {config_service.series_of(m)}\nStorage: {', '.join(s_) or '—'}\nColours: {', '.join(c_) or '—'}"
+                    + (f"\nDefault price £{default_sale_price}" if default_sale_price else "")))
             else:
-                models = await config_service.list_phone_models(session)
-                e = discord.Embed(title="📱 Phone models", colour=discord.Colour.blue())
-                e.description = "\n".join(f"• {m.model} (default price: £{m.default_sale_price or '—'})" for m in models)[:4000] or "None configured."
-                await interaction.response.send_message(embed=e)
+                groups = config_service.group_by_series(await config_service.list_phone_models(session))
+                lines = []
+                for name, ms in groups:   # oldest generation first, tiers ascending
+                    lines.append(f"**{name}**")
+                    lines += [f"• {m.model} (default price: £{m.default_sale_price or '—'})" for m in ms]
+                text = "\n".join(lines) or "None configured."
+                pages = [text[i:i + 3800] for i in range(0, len(text), 3800)] or [text]
+                embeds = [discord.Embed(title="📱 Phone models" + (f" ({i + 1}/{len(pages)})" if len(pages) > 1 else ""),
+                                        colour=discord.Colour.blue(), description=pg) for i, pg in enumerate(pages)]
+                await interaction.response.send_message(embeds=embeds[:10])
 
     # ------------------------------------------------------------------
     @app_commands.command(name="expense-types", description="Manage expense categories")

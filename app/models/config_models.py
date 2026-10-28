@@ -4,7 +4,7 @@ import datetime as dt
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import BigInteger, ForeignKey, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import JSON, BigInteger, ForeignKey, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
@@ -75,6 +75,12 @@ class PhoneModelConfig(Base, TimestampMixin):
     variant: Mapped[Optional[str]] = mapped_column(String(50))         # "Pro Max" already in model; variant for e.g. "Global"
     default_sale_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
     active: Mapped[bool] = mapped_column(default=True)
+    # Logical order of the whole list (series * 100 + position in the series) and the series it belongs to,
+    # plus the storage sizes and colourways this model came in: they feed the buy-a-phone dropdowns.
+    series: Mapped[Optional[str]] = mapped_column(String(60))
+    sort_order: Mapped[int] = mapped_column(default=100000, server_default="100000")
+    storage_options: Mapped[Optional[list]] = mapped_column(JSON)   # ["128GB", "256GB"]
+    colourways: Mapped[Optional[list]] = mapped_column(JSON)        # ["Midnight", "Starlight"]
 
     def display_name(self) -> str:
         return f"{self.manufacturer} {self.model}".strip()

@@ -7,6 +7,8 @@ with a plain-English reason.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import datetime as dt
 from decimal import Decimal, InvalidOperation
 from typing import Optional
@@ -17,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.enums import FaultStatus, RepairPartLineStatus
 from app.models.inventory_models import Part, Phone
 from app.models.repair_models import RepairPart
-from app.services import config_service
+from app.services import config_service, cosmetics
 from app.services import deals as deals_service
 from app.services import orders as orders_service
 from app.services import part_failures
@@ -29,6 +31,16 @@ from app.services import repairs as repairs_service
 
 class JobActionError(ValueError):
     pass
+
+
+class PartColourNeeded(JobActionError):
+    """The part in stock is a frame / back glass with no colour recorded. The panel asks for it, then
+    reserves: older stock fixes itself as it gets used instead of being ignored."""
+
+    def __init__(self, rp_id: int, part_id: int, part_label: str, match_colour: Optional[str], choices: list[str]):
+        super().__init__(f"{part_label} has no colour recorded: pick its colour.")
+        self.rp_id, self.part_id, self.part_label = rp_id, part_id, part_label
+        self.match_colour, self.choices = match_colour, choices
 
 
 async def _phone(session: AsyncSession, phone_id: int) -> Phone:
@@ -58,7 +70,10 @@ async def _supply(session: AsyncSession, phone: Phone, rp: RepairPart):
 
 
 # ---------------------------------------------------------------- parts
-async def reserve(session: AsyncSession, phone_id: int, rp_id: int, actor: int, part_id: Optional[int] = None) -> str:
+async def reserve(session: AsyncSession, phone_id: int, rp_id: int, actor: int, part_id: Optional[int] = None,
+                  part_colour: Optional[str] = None) -> str:
+    """Reserve a part that is already in stock (the default: it is what the panel offers whenever any
+    fitting part exists). `part_colour` records the colour of a frame / back glass that had none."""
     phone = await _phone(session, phone_id)
     rp = await _line(session, rp_id, phone_id)
     if rp.status == RepairPartLineStatus.RESERVED:
@@ -75,6 +90,17 @@ async def reserve(session: AsyncSession, phone_id: int, rp_id: int, actor: int, 
         part = next((u.part for u in units if u.kind == "IN_STOCK"), None)
     if part is None:
         raise JobActionError(f"There's no {phone_tickets.part_label(rp, phone)} in stock to reserve.")
+    role = cosmetics.part_role(part.part_type.name if part.part_type else None)
+    if role and not cosmetics.norm_colour(part.colour):
+        if not (part_colour or "").strip():
+            model = await config_service.phone_model_for(session, phone)
+            raise PartColourNeeded(
+                rp.id, part.id, phone_tickets.part_label(rp, phone) + f" `{part.internal_id}`",
+                cosmetics.counterpart_colour(phone, rp.repair, role), config_service.model_options(model)[1])
+        try:
+            await parts_service.set_part_colour(session, part, part_colour, actor)
+        except parts_service.PartStateError as e:
+            raise JobActionError(str(e))
     try:
         await parts_service.reserve_part(session, part, rp.repair, rp, actor)
     except parts_service.PartStateError as e:
@@ -304,22 +330,68 @@ async def plan_repair(session: AsyncSession, phone_id: int, actor: int) -> str:
     return f"Repair `{repair.internal_id}` planned from the open faults."
 
 
+@dataclass
+class PartChoice:
+    id: int
+    name: str
+    in_stock: int      # on the shelf and tagged for this phone's exact model
+    on_order: int      # on the way for this exact model
+
+
+async def part_choices(session: AsyncSession, phone_id: int) -> list[PartChoice]:
+    """Every part type with how many of them this phone could use right now: what the fault picker shows,
+    so what is already in stock is visible before anything gets ordered."""
+    phone = await _phone(session, phone_id)
+    available = await phone_tickets._available_parts(session)
+    incoming = await phone_tickets._orders_by_part_type(session)
+    out = []
+    for pt in await config_service.list_part_types(session):
+        in_stock = len(parts_service.fitting_parts(available.get(pt.id, []), phone.phone_model_id))
+        on_order = sum(slot[1] for slot in incoming.get(pt.id, [])
+                       if phone.phone_model_id is not None and slot[2] == phone.phone_model_id)
+        out.append(PartChoice(pt.id, pt.name, in_stock, on_order))
+    return out
+
+
 async def log_fault(session: AsyncSession, phone_id: int, actor: int, *, description: str,
-                    part_type_name: str = "") -> str:
-    """Same as /fault, plus it adds the part to the repair so the panel can act on it."""
+                    part_type_name: str = "", part_type_id: Optional[int] = None) -> str:
+    """Same as /fault, plus it adds the part to the repair so the panel can act on it. The part type is
+    chosen from the configured ones (a typed name is matched ignoring case; it never creates a new type)."""
     phone = await _phone(session, phone_id)
     description = (description or "").strip()
     if not description:
         raise JobActionError("Describe the fault.")
-    part_type_id = None
-    if (part_type_name or "").strip():
-        part_type_id = (await config_service.get_or_create_part_type(session, part_type_name.strip())).id
-    await phones_service.add_fault(session, phone, description, actor, required_part_type_id=part_type_id)
+    part_type = None
+    if part_type_id:
+        part_type = await session.get(config_service.PartTypeConfig, part_type_id)
+        if part_type is None:
+            raise JobActionError("That part type no longer exists.")
+    elif (part_type_name or "").strip():
+        part_type = await config_service.find_part_type(session, part_type_name)
+        if part_type is None:
+            names = ", ".join(p.name for p in await config_service.list_part_types(session))
+            raise JobActionError(f"There's no part type called '{part_type_name.strip()}'. Choose one of: {names}")
+    await phones_service.add_fault(session, phone, description, actor,
+                                   required_part_type_id=part_type.id if part_type else None)
     if phone.current_status in ("PURCHASED", "AWAITING_TEST", "TESTED"):
         await phones_service.set_status(session, phone, "REPAIR_REQUIRED", actor, notes="Fault logged")
-    if part_type_id:
+    if part_type:
         await repairs_service.sync_repair_with_open_faults(session, phone, actor)
-    return f"Fault logged: {description}" + (f" (needs {part_type_name.strip()})" if part_type_id else "")
+    note = f" (needs {part_type.name})" if part_type else ""
+    if part_type:   # say straight away whether it's already on the shelf
+        _, units = await _supply(session, phone, await _line_for_type(session, phone, part_type.id))
+        if units and units[0].kind == "IN_STOCK":
+            note += f": `{units[0].part.internal_id}` is in stock, press **Reserve**"
+    return f"Fault logged: {description}{note}"
+
+
+async def _line_for_type(session: AsyncSession, phone: Phone, part_type_id: int) -> RepairPart:
+    repair = await repairs_service.get_active_repair(session, phone)
+    rp = next((r for r in (repair.parts if repair else []) if r.required_part_type_id == part_type_id
+               and r.status in (RepairPartLineStatus.REQUIRED, RepairPartLineStatus.RESERVED)), None)
+    if rp is None:
+        raise JobActionError("That part isn't on the repair.")
+    return rp
 
 
 async def edit_details(session: AsyncSession, phone_id: int, actor: int, *, battery: str = "", cosmetic: str = "",

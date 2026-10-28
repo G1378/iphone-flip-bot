@@ -226,14 +226,27 @@ async def test_a_second_part_must_match_the_first_one_reserved(session, actor_id
         await parts_service.reserve_part(session, g, repair, rp["Back Glass"], actor_id)
 
 
-async def test_a_frame_with_no_colour_is_never_offered(session, actor_id):
-    await _frame(session, actor_id, None)
-    phone = await _buy(session, actor_id)
+async def test_a_frame_with_no_colour_is_still_offered_but_a_known_match_comes_first(session, actor_id):
+    """Real stock must never be hidden just because its colour wasn't recorded: it is offered (and the
+    colour is asked for on reserving), but a part whose colour is known to match is preferred."""
+    unknown = await _frame(session, actor_id, None)
+    phone = await _buy(session, actor_id)           # Blue
     await cosmetics.set_grade(session, phone, FRAME, "D", actor_id)
-    assert (await _supply(session, phone))["Housing"][0].kind == "TO_ORDER"
-    part = (await session.execute(select(Part))).scalars().one()
-    await parts_service.set_part_colour(session, part, "Blue", actor_id)
-    assert (await _supply(session, phone))["Housing"][0].kind == "IN_STOCK"
+    first = (await _supply(session, phone))["Housing"][0]
+    assert first.kind == "IN_STOCK" and first.part.id == unknown.id
+    blue = await _frame(session, actor_id, "Blue")
+    assert (await _supply(session, phone))["Housing"][0].part.id == blue.id
+    # the wrong colour is never used, with or without an unknown one on the shelf
+    await parts_service.set_part_colour(session, blue, "Black", actor_id)
+    assert (await _supply(session, phone))["Housing"][0].part.id == unknown.id
+
+
+async def test_only_wrong_coloured_stock_still_means_order(session, actor_id):
+    await _frame(session, actor_id, "Black")
+    phone = await _buy(session, actor_id)           # Blue, glass stays
+    await cosmetics.set_grade(session, phone, FRAME, "D", actor_id)
+    first = (await _supply(session, phone))["Housing"][0]
+    assert first.kind == "TO_ORDER" and first.colour == "Blue"
 
 
 async def test_an_order_in_the_wrong_colour_does_not_cover_the_need(session, actor_id):

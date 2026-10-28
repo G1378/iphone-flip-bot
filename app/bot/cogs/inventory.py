@@ -9,8 +9,9 @@ from discord import app_commands
 from discord.ext import commands
 
 from app.bot.auth import require_authorized
-from app.bot.autocomplete import phone_model_autocomplete
+from app.bot.autocomplete import phone_colour_autocomplete, phone_model_autocomplete, phone_storage_autocomplete
 from app.bot.embeds import error_embed, phone_embed, success_embed
+from app.bot.phone_intake import ModelInfo, PhoneIntakeView, parse_price, start_intake
 from app.bot.pagination import send_paginated
 from app.db import session_scope
 from app.models.enums import AcquisitionType, LockStatus
@@ -20,51 +21,37 @@ from app.services import testing as testing_service
 
 
 class BuyPhoneModal(discord.ui.Modal, title="Buy a phone"):
-    storage_colour = discord.ui.TextInput(label="Storage & Colour (e.g. 128GB Graphite)", required=False, max_length=60)
-    imei_serial = discord.ui.TextInput(label="IMEI / Serial (optional)", required=False, max_length=60)
-    price_source = discord.ui.TextInput(label="Purchase price & source (e.g. 250.00 / CEX)", required=True, max_length=100)
+    """The details dropdowns can't hold. One box per piece of information."""
+    imei = discord.ui.TextInput(label="IMEI (optional)", required=False, max_length=30)
+    serial = discord.ui.TextInput(label="Serial number (optional)", required=False, max_length=40)
+    price = discord.ui.TextInput(label="Purchase price (£)", placeholder="250.00", required=True, max_length=12)
+    source = discord.ui.TextInput(label="Bought from (e.g. CEX, eBay, Facebook)", required=False, max_length=80)
     notes = discord.ui.TextInput(label="Notes (optional)", required=False, style=discord.TextStyle.paragraph, max_length=500)
 
-    def __init__(self, acquisition_type: AcquisitionType, model: str):
+    def __init__(self, acquisition_type: AcquisitionType, model: ModelInfo, storage: Optional[str],
+                 colour: Optional[str], wizard: PhoneIntakeView):
         super().__init__()
-        self.acquisition_type = acquisition_type
-        self.model_name = model  # an exact catalog model, already checked by /buy
+        self.acquisition_type, self.model, self.storage, self.colour, self.wizard = acquisition_type, model, storage, colour, wizard
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
-            price_str, _, source = self.price_source.value.partition("/")
-            price = Decimal(price_str.strip())
-        except InvalidOperation:
-            await interaction.response.send_message(
-                embed=error_embed("Couldn't parse the purchase price. Use e.g. `250.00 / CEX`."), ephemeral=True
-            )
+            price = parse_price(self.price.value)
+        except ValueError as e:
+            await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
             return
-
-        storage, colour = None, None
-        if self.storage_colour.value:
-            parts = self.storage_colour.value.split()
-            storage = next((p for p in parts if "gb" in p.lower() or "tb" in p.lower()), None)
-            colour = " ".join(p for p in parts if p != storage) or None
-
-        imei, serial = None, None
-        if self.imei_serial.value:
-            bits = self.imei_serial.value.split("/")
-            imei = bits[0].strip() or None
-            serial = bits[1].strip() if len(bits) > 1 else None
-
         async with session_scope() as session:
             data = phones_service.BuyPhoneInput(
                 manufacturer="Apple",
-                model=self.model_name,
+                model=self.model.name,
                 variant=None,
-                storage=storage,
-                colour=colour,
-                imei=imei,
-                serial_number=serial,
+                storage=self.storage,
+                colour=self.colour,
+                imei=self.imei.value.strip() or None,
+                serial_number=self.serial.value.strip() or None,
                 carrier=None,
                 purchase_price=price,
                 purchase_date=dt.date.today(),
-                seller_source=source.strip() or None,
+                seller_source=self.source.value.strip() or None,
                 acquisition_type=self.acquisition_type,
                 notes=self.notes.value or None,
                 location_code=None,
@@ -77,7 +64,7 @@ class BuyPhoneModal(discord.ui.Modal, title="Buy a phone"):
             embed = phone_embed(phone)
 
         embed.title = f"✅ Bought — {embed.title}"
-        await interaction.response.send_message(embed=embed)
+        await self.wizard.complete(interaction, embed)
 
 
 class InventoryCog(commands.Cog):
@@ -86,21 +73,19 @@ class InventoryCog(commands.Cog):
 
     @app_commands.command(name="buy", description="Record the purchase of a phone (resale or repair)")
     @app_commands.describe(acquisition_type="Why you bought this phone",
-                           model="Exact model: base, mini, Plus, Pro and Pro Max take different parts")
+                           model="Optional: skip the generation/model dropdowns by naming the exact model")
     @app_commands.choices(acquisition_type=[
         app_commands.Choice(name="Resale (working, sell as-is)", value="RESALE"),
         app_commands.Choice(name="Repair (faulty, fix then sell)", value="REPAIR"),
     ])
     @app_commands.autocomplete(model=phone_model_autocomplete)
     @require_authorized()
-    async def buy(self, interaction: discord.Interaction, acquisition_type: app_commands.Choice[str], model: str):
-        async with session_scope() as session:
-            try:
-                catalog = await config_service.resolve_phone_model(session, model)
-            except config_service.UnknownPhoneModelError as e:
-                await interaction.response.send_message(embed=error_embed(str(e)), ephemeral=True)
-                return
-        await interaction.response.send_modal(BuyPhoneModal(AcquisitionType(acquisition_type.value), catalog.model))
+    async def buy(self, interaction: discord.Interaction, acquisition_type: app_commands.Choice[str],
+                  model: Optional[str] = None):
+        acq = AcquisitionType(acquisition_type.value)
+        await start_intake(
+            interaction, heading="📱 Buy a phone", model_name=model,
+            build_modal=lambda m, storage, colour, wizard: BuyPhoneModal(acq, m, storage, colour, wizard))
 
     @app_commands.command(name="stock", description="List current phone inventory")
     @app_commands.describe(status="Filter by status (optional)")
@@ -135,18 +120,22 @@ class InventoryCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="edit-phone", description="Edit a phone's details")
-    @app_commands.describe(model="Correct the phone's exact model (blocked while parts are reserved or fitted)")
-    @app_commands.autocomplete(model=phone_model_autocomplete)
+    @app_commands.describe(model="Correct the phone's exact model (blocked while parts are reserved or fitted)",
+                           storage="Pick one of the sizes this model came in",
+                           colour="Pick one of the colours this model came in")
+    @app_commands.autocomplete(model=phone_model_autocomplete, storage=phone_storage_autocomplete,
+                               colour=phone_colour_autocomplete)
     @require_authorized()
     async def edit_phone(
         self, interaction: discord.Interaction, internal_id: str,
         battery_health: Optional[int] = None, cosmetic_condition: Optional[str] = None,
         functional_condition: Optional[str] = None, colour: Optional[str] = None,
-        notes: Optional[str] = None, model: Optional[str] = None,
+        notes: Optional[str] = None, model: Optional[str] = None, storage: Optional[str] = None,
     ):
         fields = {k: v for k, v in {
             "battery_health": battery_health, "cosmetic_condition": cosmetic_condition,
             "functional_condition": functional_condition, "colour": colour, "notes": notes,
+            "storage": config_service.normalise_storage(storage) if storage else None,
         }.items() if v is not None}
         if not fields and not model:
             await interaction.response.send_message(embed=error_embed("Nothing to update — provide at least one field."), ephemeral=True)
