@@ -234,6 +234,11 @@ class PriceRecommendation:
     repair_cost_is_historical: bool
     recommended_buy_used: Optional[Decimal]
     recommended_buy_faulty: Optional[Decimal]
+    # The workings behind the two numbers above, so the deal scanner can show real profit/ROI.
+    resale_price: Optional[Decimal] = None     # what a working one is expected to sell for (after any asking-price haircut)
+    sale_costs: Optional[Decimal] = None       # eBay fees + postage out + packaging
+    min_profit: Decimal = Decimal("20.00")
+    resale_is_estimate: bool = False           # True = based on asking prices rather than sold prices
 
 
 async def compute_recommendation(session: AsyncSession, entry: PriceWatchlistEntry) -> PriceRecommendation:
@@ -245,6 +250,7 @@ async def compute_recommendation(session: AsyncSession, entry: PriceWatchlistEnt
     postage = await config_service.get_setting_decimal(session, "default_postage_cost", Decimal("2.98"))
     packaging = await config_service.get_setting_decimal(session, "default_packaging_cost", Decimal("1.00"))
     min_profit = await config_service.get_setting_decimal(session, "min_profit_gbp", Decimal("20.00"))
+    haircut = await config_service.get_setting_decimal(session, "asking_price_haircut_pct", Decimal("0"))
 
     historical_repair_cost = await average_repair_cost_for_model(session, entry.phone_model_id)
     default_repair_cost = await config_service.get_setting_decimal(session, "default_repair_cost_assumption", Decimal("60.00"))
@@ -252,9 +258,17 @@ async def compute_recommendation(session: AsyncSession, entry: PriceWatchlistEnt
 
     recommended_used = None
     recommended_faulty = None
+    resale_price = None
+    sale_costs = None
+    is_estimate = False
     if used_obs:
         resale_price = used_obs.median_price
+        is_estimate = used_obs.source == PriceDataSource.ACTIVE_LISTING_ESTIMATE
+        if is_estimate and haircut > 0:
+            # Asking prices overstate what phones sell for; shave them before trusting them.
+            resale_price = (resale_price * (Decimal("100") - haircut) / Decimal("100")).quantize(TWO_DP, rounding=ROUND_HALF_UP)
         estimated_fees = (resale_price * fee_pct / Decimal("100") + fee_fixed).quantize(TWO_DP, rounding=ROUND_HALF_UP)
+        sale_costs = (estimated_fees + postage + packaging).quantize(TWO_DP, rounding=ROUND_HALF_UP)
         recommended_used = (resale_price - estimated_fees - postage - packaging - min_profit).quantize(TWO_DP, rounding=ROUND_HALF_UP)
         # Faulty buy price = expected resale-after-repair minus repair cost
         # minus the same sale-side costs minus target profit (per confirmed
@@ -271,6 +285,10 @@ async def compute_recommendation(session: AsyncSession, entry: PriceWatchlistEnt
         repair_cost_is_historical=historical_repair_cost is not None,
         recommended_buy_used=recommended_used,
         recommended_buy_faulty=recommended_faulty,
+        resale_price=resale_price,
+        sale_costs=sale_costs,
+        min_profit=min_profit,
+        resale_is_estimate=is_estimate,
     )
 
 

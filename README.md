@@ -142,7 +142,8 @@ Fill in at minimum: `DISCORD_BOT_TOKEN`, `DISCORD_BOOTSTRAP_ADMIN_IDS`,
 `POSTGRES_PASSWORD`. Everything else (eBay, Sheets) can be left blank —
 the app runs normally with those integrations reporting as "not
 configured" until you fill them in later. See `.env.example` for a full
-description of every variable.
+description of every variable. The optional Vinted scraper has its own
+variables (`VINTED_*`): see [`docs/BUY_PAGE.md`](docs/BUY_PAGE.md) before enabling it.
 
 **Never** put API keys/tokens in Discord messages, `/config` values, or
 logs — they belong in `.env` only, and the app is written to never echo
@@ -342,6 +343,18 @@ top, for where these are defined).
 
 ---
 
+## 10b. The buy page: deals from eBay and Vinted
+
+The deal scanner turns your watchlist into a **buy page**: listings that beat your profit rules appear in
+`🛒-buy-page` as cards with **Bought** / **Reject** buttons. A deal only appears if it is under your maximum
+price *after* selling fees, postage, packaging, your minimum profit and (for faulty phones) a per-fault repair
+estimate, *and* it meets your minimum ROI. Vinted is optional and off by default; it needs a proxy.
+
+**Full guide, rules, settings and Vinted setup: [`docs/BUY_PAGE.md`](docs/BUY_PAGE.md).**
+Commands: `/deal-scan` `/deals` `/buy-page` `/deal-status`.
+
+---
+
 ## 11. Discord command reference
 
 | Group | Commands |
@@ -355,6 +368,7 @@ top, for where these are defined).
 | Repairs | `/repair` `/repair-status` `/analyse` |
 | Orders | `/order` `/orders` `/receive` |
 | eBay | `/list` `/listing` `/ebay-sync` `/ebay-status` |
+| Buy page | `/deal-scan` `/deals` `/buy-page` `/deal-status` `/ebay-parts` |
 | Finance | `/report` `/stock-value` `/profit` `/sales` `/expenses` |
 | Search | `/search` |
 | Config (admin only) | `/config business` `/config users` `/config channels` `/config locations` `/config tests` `/config part-types` `/config phone-models` `/config expense-types` `/config statuses` `/config thresholds` `/config pricing-rules` `/config ebay` `/config sheets` `/config reset-defaults` |

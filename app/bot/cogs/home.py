@@ -28,6 +28,7 @@ CHANNEL_PLAN: list[tuple[str, str, str]] = [
     ("donors-parts", "🔩-donors-parts", "`/donor` `/donors` `/teardown` `/donor-parts` `/allocate-cost` `/parts` `/part` `/find-part` `/reserve-part` `/install-part` `/remove-part` `/scrap-part` `/move-part` `/parts-needed`"),
     ("repairs", "🔧-repairs", "`/repair` `/repair-status` `/analyse` `/order` `/orders` `/receive`"),
     ("finance", "💷-finance", "`/report` `/stock-value` `/profit` `/sales` `/expenses`"),
+    ("buy-page", "🛒-buy-page", "Deals found on eBay and Vinted that beat your profit rules appear here as cards. Press **Bought** (records the phone in inventory) or **Reject**. `/deals` `/deal-scan` `/buy-page` `/deal-status`"),
     ("ebay-listings", "🏷️-ebay-listings", "`/list` `/listing` `/ebay-sync` `/ebay-status`"),
     ("tasks", "✅-tasks", "Automatic tickets: one per phone showing its next step (test, swap parts, re-test, prep, list, ship), plus general business tickets. `/tasks phone` `/tasks list` `/tasks summary` `/tasks add` `/tasks setup-general` `/tasks template-list` `/tasks template-add` `/tasks template-toggle`"),
     ("admin", "⚙️-admin", "`/config business` `/config users` `/config channels` `/config locations` `/config tests` `/config part-types` `/config phone-models` `/config expense-types` `/config statuses` `/config thresholds` `/config pricing` `/config ebay` `/config sheets` `/config reset-defaults` `/demo`"),
@@ -36,7 +37,7 @@ CHANNEL_PLAN: list[tuple[str, str, str]] = [
 CHANNEL_LOOKUP = {key: (name, cheat) for key, name, cheat in CHANNEL_PLAN}
 
 # Which channels get a jump-button on the home dashboard, and in what order.
-JUMP_ORDER = ["inventory", "donors-parts", "repairs", "tasks", "finance", "ebay-listings", "admin", "notifications"]
+JUMP_ORDER = ["inventory", "donors-parts", "repairs", "tasks", "finance", "buy-page", "ebay-listings", "admin", "notifications"]
 
 
 async def _build_home_embed(session, bot) -> discord.Embed:

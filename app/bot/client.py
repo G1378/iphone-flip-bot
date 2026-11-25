@@ -6,11 +6,13 @@ import logging
 import discord
 from discord.ext import commands
 
+from app.bot.deal_cards import post_deal_cards, refresh_card
 from app.bot.autodefer import AutoDeferTree, install_send_message_fallback, monitor_event_loop_lag
 from app.config import settings
 from app.db import session_scope
 from app.integrations.ebay import get_ebay_client
 from app.integrations.sheets import SheetsClient
+from app.integrations.vinted import get_vinted_client
 from app.jobs.scheduler import JobScheduler
 from app.services import config_service
 
@@ -44,6 +46,7 @@ class FlipBot(commands.Bot):
 
         self.ebay_client = get_ebay_client()
         self.sheets_client = SheetsClient()
+        self.vinted_client = get_vinted_client()
         self.job_scheduler: JobScheduler | None = None
         self._lag_monitor_task: asyncio.Task | None = None
 
@@ -68,7 +71,10 @@ class FlipBot(commands.Bot):
         install_send_message_fallback()
         self._lag_monitor_task = asyncio.create_task(monitor_event_loop_lag())
 
-        self.job_scheduler = JobScheduler(self.ebay_client, self.sheets_client, self._notify_channels)
+        self.job_scheduler = JobScheduler(
+            self.ebay_client, self.sheets_client, self._notify_channels, vinted_client=self.vinted_client,
+            deal_post_fn=self._post_deals, deal_refresh_fn=self._refresh_deals,
+        )
         self.job_scheduler.start()
 
     async def _notify_channels(self, message: str) -> None:
@@ -86,6 +92,17 @@ class FlipBot(commands.Bot):
             except discord.HTTPException as e:
                 logger.warning("Failed to notify channel %s: %s", channel_id, e)
 
+    async def _post_deals(self, alert_ids: list[int]) -> int:
+        return await post_deal_cards(self, alert_ids)
+
+    async def _refresh_deals(self, alert_ids: list[int]) -> None:
+        from app.services import deal_queue
+        for alert_id in alert_ids:
+            async with session_scope() as session:
+                alert = await deal_queue.get_alert(session, alert_id)
+            if alert is not None:
+                await refresh_card(self, alert)
+
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (id=%s)", self.user, self.user.id if self.user else "?")
 
@@ -96,6 +113,7 @@ class FlipBot(commands.Bot):
             await self.job_scheduler.shutdown()
         if hasattr(self.ebay_client, "aclose"):
             await self.ebay_client.aclose()
+        await self.vinted_client.aclose()
         await super().close()
 
 

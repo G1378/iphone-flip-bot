@@ -169,4 +169,17 @@ DEFAULT_BUSINESS_SETTINGS = [
     ("ebay_merchant_location_key", "", "string", "eBay stock location listings are published from (set by /config ebay-setup)"),
     ("default_repair_cost_assumption", "60.00", "number",
      "Fallback repair cost estimate used for faulty-phone buy price recommendations when a model has no repair history yet"),
+    # ---- buy page (see docs/BUY_PAGE.md). Every one of these has the same default in code, so an
+    # ---- existing database that was seeded before they existed behaves identically.
+    ("asking_price_haircut_pct", "0", "number",
+     "Knock this % off resale estimates that come from eBay ASKING prices (not sold). Asking prices run 10-20% above what phones really sell for, so 10 is a sensible value"),
+    ("deal_suspicious_pct", "50", "number",
+     "Flag a working-phone listing priced below this % of its resale value: usually a scam, a lock or hidden damage"),
+    ("deal_pending_ttl_hours", "48", "number", "Buy-page cards nobody acted on are marked expired after this many hours"),
+    ("vinted_buyer_fee_pct", "5", "number", "Vinted buyer protection fee: % of the item price (used when Vinted doesn't state the fee)"),
+    ("vinted_buyer_fee_fixed", "0.70", "number", "Vinted buyer protection fee: fixed amount added on top of the %"),
+    ("repair_labour_gbp", "0", "number", "Labour you charge yourself per repair, added to the repair estimate on buy-page cards"),
+    ("repair_contingency_pct", "10", "number", "Extra % added to estimated part costs (hidden second faults, bad parts)"),
+    ("repair_part_cost_defaults", "", "string",
+     "Fallback part prices for buy-page repair estimates, e.g. screen=55, battery=20, back glass=30. Your own purchase history is used first; blank = built-in defaults"),
 ]

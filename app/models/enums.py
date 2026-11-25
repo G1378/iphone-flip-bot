@@ -131,3 +131,20 @@ class InventoryEventType(str, enum.Enum):
     PRICE_WATCHLIST_ADDED = "PRICE_WATCHLIST_ADDED"
     PRICE_WATCHLIST_REMOVED = "PRICE_WATCHLIST_REMOVED"
     PRICE_OBSERVED = "PRICE_OBSERVED"
+    DEAL_BOUGHT = "DEAL_BOUGHT"
+    DEAL_REJECTED = "DEAL_REJECTED"
+    DEAL_RESTORED = "DEAL_RESTORED"
+
+
+class DealSource(str, enum.Enum):
+    EBAY = "EBAY"
+    VINTED = "VINTED"
+
+
+class DealStatus(str, enum.Enum):
+    """Where a buy-page card is. Stored as plain text on deal_alerts (no DB enum to migrate)."""
+    PENDING = "PENDING"      # on the buy page, waiting for Bought / Reject
+    BOUGHT = "BOUGHT"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"      # auction ended or nobody acted in time
+    ARCHIVED = "ARCHIVED"    # announced as a plain message before the buy page existed
