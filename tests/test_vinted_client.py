@@ -15,7 +15,7 @@ from app.integrations.vinted import client as vc
 from app.integrations.vinted.interface import VintedApiError, VintedBlockedError, VintedNotConfiguredError
 
 DOMAIN = "www.vinted.test"
-HOME_HTML = "<html>" + "x" * 50000 + " recaptcha config </html>"       # a real page is big and may mention "captcha"
+HOME_HTML = '<html><meta name="x" content="y">' + "x" * 50000 + ' recaptcha config "csrf_token":"page-csrf-0123456789abcdef" </html>'   # big, mentions captcha
 
 
 class Resp:
@@ -41,17 +41,20 @@ def item(i=1, price="150.0", **kw):
 class FakeSession:
     """Answers like Vinted: home page first, then JSON. `api` is a list of responses handed out in order
     (the last one repeats); an Exception in it is raised instead."""
-    def __init__(self, api=None, home=None):
+    def __init__(self, api=None, home=None, pages=None, cookies=None):
         self.api = list(api if api is not None else [Resp(body={"items": [item()]})])
         self.home = home or Resp(body=HOME_HTML, ctype="text/html")
+        self.pages = pages or {}                       # exact url -> Resp (e.g. an item page)
         self.calls: list[dict] = []
-        self.cookies = {"anon_id": "anon-123"}
+        self.cookies = {"anon_id": "anon-123", "access_token_web": "tok-abc", "csrf_token": "csrf-cookie-0123456789"} if cookies is None else cookies
         self.closed = False
 
     async def get(self, url, params=None, headers=None):
         self.calls.append({"url": url, "params": params, "headers": headers or {}})
         if url.rstrip("/") == f"https://{DOMAIN}":
             return self.home
+        if url in self.pages:
+            return self.pages[url]
         r = self.api.pop(0) if len(self.api) > 1 else self.api[0]
         if isinstance(r, Exception):
             raise r
@@ -137,11 +140,12 @@ async def test_it_visits_the_home_page_first_then_searches_with_browser_like_hea
     assert [i.item_id for i in items] == ["1"]
     assert s.calls[0]["url"] == f"https://{DOMAIN}/"                           # warm-up came first
     api = s.calls[1]
-    assert api["url"] == f"https://{DOMAIN}/api/v2/catalog/items"
+    assert api["url"] == "https://api.vinted.test/svc-catalogue/items"         # the catalogue moved host in Sept 2026
     assert api["params"]["search_text"] == "iPhone 13 128GB" and api["params"]["order"] == "newest_first"
-    assert api["params"]["price_to"] == "200"
-    assert api["headers"]["x-anon-id"] == "anon-123" and "catalog?search_text=" in api["headers"]["Referer"]
-    assert api["headers"]["Accept-Language"].startswith("en-GB")
+    assert api["params"]["price_to"] == "200" and "currency" not in api["params"]
+    h = api["headers"]
+    assert h["Authorization"] == "Bearer tok-abc" and h["X-Anon-Id"] == "anon-123" and h["X-Csrf-Token"] == "csrf-cookie-0123456789"
+    assert h["Origin"] == f"https://{DOMAIN}" and "catalog?search_text=" in h["Referer"] and h["Accept-Language"].startswith("en-GB")
 
 
 @pytest.mark.asyncio
@@ -285,3 +289,163 @@ def test_the_factory_returns_a_disabled_mock_that_says_why():
     from app.integrations.vinted import get_vinted_client
     c = get_vinted_client()                 # the test environment has VINTED_ENABLED unset
     assert not c.configured and "VINTED_ENABLED" in c.health().reason
+
+
+# ------------------------------------------------------------------ /vinted-test (probe)
+CHALLENGE = "<html>Please enable JS and complete the captcha</html>"
+
+
+@pytest.mark.asyncio
+async def test_probe_says_when_the_ip_is_refused_at_the_front_door():
+    s = FakeSession(home=Resp(403, CHALLENGE, ctype="text/html", headers={"server": "DataDome"}))
+    c, _ = make({P1: s})
+    lines = await c.probe()
+    text = "\n".join(lines)
+    assert "HTTP 403" in text and "front door" in text and "residential" in text
+    assert len(s.calls) == 1                                                    # it did not go on to the search
+    assert c.health().routes_available == 0                                     # and the route now cools down
+
+
+@pytest.mark.asyncio
+async def test_probe_says_when_only_the_search_is_challenged():
+    s = FakeSession(api=[Resp(403, CHALLENGE, ctype="text/html")])
+    c, _ = make({P1: s})
+    text = "\n".join(await c.probe())
+    assert "1. Home page: HTTP 200" in text and "svc-catalogue/items): HTTP 403" in text and "search call was challenged" in text
+
+
+@pytest.mark.asyncio
+async def test_probe_reports_success_with_what_it_parsed():
+    c, _ = make({P1: FakeSession()})
+    text = "\n".join(await c.probe())
+    assert "Working: 1 results, 1 usable" in text and "iPhone 13 128GB #1" in text and "anon_id" in text
+
+
+@pytest.mark.asyncio
+async def test_probe_flags_an_api_that_has_changed_shape():
+    c, _ = make({P1: FakeSession(api=[Resp(body={"results": [], "meta": 1})])})
+    text = "\n".join(await c.probe())
+    assert "without an 'items' list" in text and "results, meta" in text
+
+
+@pytest.mark.asyncio
+async def test_probe_sends_nothing_while_cooling_down():
+    s = FakeSession(home=Resp(403, CHALLENGE, ctype="text/html"))
+    c, _ = make({P1: s})
+    await c.probe()
+    n = len(s.calls)
+    text = "\n".join(await c.probe())
+    assert len(s.calls) == n and "cooling down" in text
+
+
+@pytest.mark.asyncio
+async def test_a_proxy_failure_is_told_apart_from_a_block_and_leaks_no_password():
+    class Boom(FakeSession):
+        async def get(self, *a, **k):
+            raise ConnectionError(f"proxy {P1} refused the login")
+    c, _ = make({P1: Boom()})
+    text = "\n".join(await c.probe())
+    assert "could not connect" in text and "Vinted never saw a request" in text
+    assert "secret" not in text and "<proxy>" in text
+
+
+def test_redaction_removes_credentials_wherever_they_appear():
+    assert "hunter2" not in vc._redact("failed via http://bob:hunter2@10.1.1.1:80/x")
+    assert vc._redact("x " + P1 + " y", P1) == "x <proxy> y"
+
+
+@pytest.mark.asyncio
+async def test_the_cooling_message_now_says_why():
+    s = FakeSession(api=[Resp(403, "no", ctype="text/html")])
+    c, _ = make({P1: s})
+    with pytest.raises(VintedBlockedError):
+        await c.search_items("a")
+    with pytest.raises(VintedBlockedError) as e:
+        await c.search_items("b")
+    assert "HTTP 403" in str(e.value)                                           # the Discord summary shows the cause
+
+
+# ------------------------------------------------------------------ the September 2026 API move
+def test_the_api_host_is_derived_from_the_site_and_can_be_overridden():
+    assert vc.VintedClient(domain="www.vinted.co.uk", proxies=[], require_proxy=False).api_base == "https://api.vinted.co.uk"
+    assert vc.VintedClient(domain="www.vinted.co.uk", proxies=[], require_proxy=False, api_host="api.example.test").api_base == "https://api.example.test"
+
+
+def test_blank_parameters_are_never_sent_and_the_renamed_filter_is_used():
+    c = vc.VintedClient(domain=DOMAIN, proxies=[], require_proxy=False, catalog_ids=["3661", "12"])
+    p = c._search_params("iPhone 13", None, 40)
+    assert "price_to" not in p and "catalog_ids" not in p                        # blank price, and the old filter name is silently ignored by Vinted
+    assert p["attribute_ids[catalog]"] == "3661,12" and p["per_page"] == "40"
+    assert all(v not in (None, "") for v in p.values())
+    p = vc.VintedClient(domain=DOMAIN, proxies=[], require_proxy=False)._search_params("a", Decimal("99.5"), 5)
+    assert p["price_to"] == "99.5" and "attribute_ids[catalog]" not in p
+
+
+@pytest.mark.asyncio
+async def test_the_csrf_token_is_read_from_the_page_when_it_is_not_a_cookie():
+    s = FakeSession(cookies={"anon_id": "a1", "access_token_web": "tok"})
+    c, _ = make({P1: s})
+    await c.search_items("a")
+    assert s.calls[1]["headers"]["X-Csrf-Token"] == "page-csrf-0123456789abcdef"
+
+
+@pytest.mark.asyncio
+async def test_no_session_token_is_reported_plainly_not_guessed_around():
+    c, _ = make({P1: FakeSession(cookies={"anon_id": "a1"})})
+    with pytest.raises(VintedApiError, match="did not hand out a session token"):
+        await c.search_items("a")
+
+
+@pytest.mark.asyncio
+async def test_a_404_is_a_real_answer_not_a_reason_to_refresh_and_retry():
+    s = FakeSession(api=[Resp(404, {"code": 404, "message": "Not found"})])
+    c, _ = make({P1: s})
+    with pytest.raises(VintedApiError, match="HTTP 404 for /svc-catalogue/items"):
+        await c.search_items("a")
+    assert [x["url"] for x in s.calls].count("https://api.vinted.test/svc-catalogue/items") == 1   # no retry loop
+    assert [x["url"] for x in s.calls].count(f"https://{DOMAIN}/") == 1                              # and no cookie refresh
+    h = c.health()
+    assert h.requests_blocked == 0 and h.routes_available == 1                                       # a wrong path is not a block
+
+
+@pytest.mark.asyncio
+async def test_vinteds_own_error_text_reaches_the_message():
+    c, _ = make({P1: FakeSession(api=[Resp(400, '{"error":"INVALID_REQUEST","message":"price_to must not be blank"}', ctype="application/json")])})
+    with pytest.raises(VintedApiError, match="INVALID_REQUEST"):
+        await c.search_items("a")
+
+
+def test_items_in_the_new_shape_parse_brand_and_condition_from_the_item_box():
+    i = vc.parse_item({"id": 9, "title": "iPhone 13", "price": {"amount": "150", "currency_code": "GBP"},
+                       "url": "/items/9-iphone-13", "item_box": {"first_line": "Apple", "second_line": "128 GB · Very good"}}, DOMAIN)
+    assert i.url == f"https://{DOMAIN}/items/9-iphone-13" and i.brand == "Apple" and i.condition == "Very good"
+    j = vc.parse_item({"id": 10, "title": "x", "price": "5", "item_box": {"second_line": "Good"}}, DOMAIN)
+    assert j.condition == "Good"                                                                       # no size: the line is just the condition
+
+
+def test_page_description_extraction():
+    ld = '<script type="application/ld+json">{"@type":"Product","description":"No cracks.\\nBattery 91% \\"boxed\\""}</script>'
+    assert vc.extract_page_description(ld) == 'No cracks.\nBattery 91% "boxed"'
+    og = '<meta property="og:description" content="Fine phone &amp; charger">'
+    assert vc.extract_page_description(og) == "Fine phone & charger"
+    assert vc.extract_page_description("<html>nothing</html>") is None
+
+
+@pytest.mark.asyncio
+async def test_a_description_falls_back_to_the_item_page_and_remembers_the_json_endpoint_is_gone():
+    page = Resp(body='<html><meta property="og:description" content="Battery health 90%, no cracks"></html>', ctype="text/html")
+    s = FakeSession(api=[Resp(404, {"code": 404})], pages={f"https://{DOMAIN}/items/1": page, f"https://{DOMAIN}/items/2": page})
+    c, _ = make({P1: s})
+    assert await c.get_description("1") == "Battery health 90%, no cracks"
+    assert await c.get_description("2") == "Battery health 90%, no cracks"
+    json_calls = [x["url"] for x in s.calls if "/api/v2/items/" in x["url"]]
+    assert json_calls == [f"https://{DOMAIN}/api/v2/items/1"]                   # the dead endpoint is tried once, not every time
+
+
+@pytest.mark.asyncio
+async def test_probe_reports_the_tokens_and_vinteds_own_error_body():
+    s = FakeSession(api=[Resp(400, '{"error":"INVALID_REQUEST"}', ctype="application/json")], cookies={"access_token_web": "tok"})
+    c, _ = make({P1: s})
+    text = "\n".join(await c.probe())
+    assert "session token: yes · anon id: NO · csrf: page" in text
+    assert "api.vinted.test/svc-catalogue/items" in text and "INVALID_REQUEST" in text and "parameters" in text

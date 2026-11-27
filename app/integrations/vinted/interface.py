@@ -68,5 +68,9 @@ class VintedClientInterface(abc.ABC):
     @abc.abstractmethod
     def health(self) -> VintedHealth: ...
 
+    async def probe(self, query: str = "iPhone 13") -> list[str]:
+        """One home-page request and one search, reported step by step (for /vinted-test). Never raises."""
+        return ["Not available for this client."]
+
     async def aclose(self) -> None:  # pragma: no cover - nothing to close for the mock
         return None

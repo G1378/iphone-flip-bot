@@ -49,13 +49,14 @@ class Settings(BaseSettings):
     # home IP is never the one that gets flagged.
     vinted_enabled: bool = False
     vinted_domain: str = "www.vinted.co.uk"
+    vinted_api_host: str = ""              # blank = derive (www.vinted.co.uk -> api.vinted.co.uk). Since Sept 2026 search lives on the api. host
     vinted_proxy_urls: str = ""            # comma separated: http://user:pass@host:port
     vinted_require_proxy: bool = True
     vinted_catalog_ids: str = ""           # optional category filter, comma separated (blank = search text only)
     vinted_scan_interval_minutes: int = 15  # 0 = never scan Vinted automatically
     vinted_min_request_interval_seconds: float = 6.0
     vinted_results_per_query: int = 40
-    vinted_max_detail_lookups_per_scan: int = 15   # listing-page fetches (to read descriptions) per scan
+    vinted_max_detail_lookups_per_scan: int = 8   # listing-page fetches (to read descriptions) per scan
 
     # --- Google Sheets ----------------------------------------------------
     google_service_account_file: str = "/run/secrets/google_service_account.json"

@@ -46,5 +46,8 @@ class MockVintedClient(VintedClientInterface):
         self.description_lookups.append(item_id)
         return self.descriptions.get(item_id)
 
+    async def probe(self, query: str = "iPhone 13") -> list[str]:
+        return ["(mock client: no real request was made)"] if self.configured else [self.reason or "Vinted is off."]
+
     def health(self) -> VintedHealth:
         return VintedHealth(configured=self.configured, reason=self.reason)

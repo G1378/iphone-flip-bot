@@ -165,6 +165,17 @@ class DealsCog(commands.Cog):
                     value=f"{c.pending} waiting (≈ £{c.pending_profit:,.2f}) · {c.bought} bought · {c.rejected} rejected · {c.expired} expired")
         await interaction.response.send_message(embed=e)
 
+    @app_commands.command(name="vinted-test", description="Send ONE home-page request and ONE search to Vinted and show what came back")
+    @require_authorized()
+    async def vinted_test(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True)
+        vinted = self.bot.vinted_client
+        if not vinted.configured:
+            await interaction.followup.send(embed=error_embed(f"Vinted is off: {vinted.health().reason}"))
+            return
+        lines = await vinted.probe()
+        await interaction.followup.send("```\n" + "\n".join(lines)[:1850] + "\n```")
+
     # ------------------------------------------------------------------ part finder
     @app_commands.command(name="ebay-parts", description="Cheapest eBay listings for a part, for one exact model")
     @app_commands.describe(part_type="e.g. screen, battery", model="Exact model (a 13 Pro screen is not a 13 screen)")

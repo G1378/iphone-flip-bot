@@ -92,6 +92,11 @@ proxy. It is against Vinted's terms of use, Vinted can block it or change it at 
 without access to the live site**: the endpoint paths and field names are the ones Vinted's web app is known to use
 but have not been verified here. Treat the first run as a test (see below).
 
+> **September 2026:** Vinted retired its old search endpoint (`/api/v2/catalog/items` now returns **404 for everyone**) and moved
+> it to `api.vinted.co.uk/svc-catalogue/items`, which needs an anonymous bearer token and two extra headers. The client
+> follows that change as other open-source scrapers have documented it, but I could not test it against the live site, so
+> expect `/vinted-test` to need one or two rounds before it says ✅.
+
 ### Switching it on
 
 ```env
@@ -112,7 +117,8 @@ One consistent browser identity per proxy (same cookies/headers/fingerprint for 
 page first to get Vinted's session cookies and refreshes them when they expire; a sticky proxy for the whole scan;
 slow, irregular pacing (`VINTED_MIN_REQUEST_INTERVAL_SECONDS` × random 0.8–1.7); a different model order each scan;
 scans every 15 minutes with ±2 minutes of jitter and no burst at start-up; description pages are fetched only for
-listings that already look like deals, capped at 15 per scan.
+listings that already look like deals, capped at 8 per scan (set `VINTED_MAX_DETAIL_LOOKUPS_PER_SCAN`). Reading a description can mean loading the whole
+item page, which is heavy: on a per-GB residential proxy this is what costs money, so keep the cap low.
 
 ### What it will not do
 
@@ -124,6 +130,16 @@ cools down for 5 min, then 15, 45, 2h15, 6h; the next proxy is tried; if none ar
 ### Verify it on day one
 
 1. `VINTED_ENABLED=true`, restart, run **`/deal-status`**: Vinted should show `1/1 routes available`.
+1b. Run **`/vinted-test`**. It sends exactly one home-page request and one search and reports each step. Read it first:
+    * *"refused this IP at the front door"* (home page 403): Vinted rejects the proxy's IP before any search. The proxy
+      type is the problem (datacentre / flagged range). Only a UK **residential or mobile** proxy can help.
+    * *"home page loaded but the search call was challenged"*: Vinted's bot detection. Retrying makes it worse.
+      Try a residential IP; if it is still challenged there, stop. Don't escalate to CAPTCHA solving or stealth browsers.
+    * *"could not connect"*: the proxy itself failed (host/port/login). Vinted never saw a request.
+    * *"HTTP 404 for /svc-catalogue/items"*: the catalogue moved again. *"HTTP 400 … INVALID_REQUEST"*: a parameter name
+      isn't accepted. *"session token: NO"*: Vinted's home page didn't hand out the anonymous token. Send those lines over.
+    * *"without an 'items' list"*: Vinted's API shape differs from what this client expects. Send that line over.
+    * *"✅ Working"*: carry on to the next step.
 2. Run **`/deal-scan source:Vinted only`**. Read the summary line: *checked N listings* means the search worked.
    `0 checked` with no error means Vinted answered but nothing matched; an error mentioning *"API may have
    changed"* means a field or path changed. The fix is local to `app/integrations/vinted/client.py`
@@ -139,6 +155,7 @@ cools down for 5 min, then 15, 45, 2h15, 6h; the next proxy is tried; if none ar
 | `/deals [status]` | counts, and the last 10 waiting / bought / rejected / expired |
 | `/buy-page` | post any waiting deals that don't have a card yet |
 | `/deal-status` | last scan results, Vinted route health, the queue |
+| `/vinted-test` | one home-page request + one search to Vinted, reported step by step (shows why it is blocked) |
 | `/ebay-parts` | unchanged |
 
 **Bought** opens a form pre-filled with the all-in price: change it to what you *actually* paid (postage and fees
